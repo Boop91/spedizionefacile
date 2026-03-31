@@ -47,6 +47,8 @@ use App\Cart\MyMoney;
 use App\Models\PackageAddress;
 use App\Models\Package;
 use App\Models\Service;
+use App\Services\CartService;
+use App\Services\ShipmentServicePricingService;
 use Illuminate\Support\Facades\DB;
 use App\Http\Resources\PackageResource;
 use App\Http\Requests\PackageStoreRequest;
@@ -124,12 +126,7 @@ class CartController extends Controller
     // Calcola il subtotale del carrello sommando i prezzi di tutti i pacchi
     // I prezzi sono in centesimi (es. 900 = 9,00 euro)
     public function subtotal($packages) {
-
-        $subtotal = $packages->sum(function($package) {
-            return (int) $package->single_price;
-        });
-
-        return new MyMoney($subtotal);
+        return CartService::subtotalFromModels($packages);
     }
 
     // Prepara le informazioni aggiuntive (meta) per la risposta
@@ -149,22 +146,7 @@ class CartController extends Controller
      */
     private function buildMergeKey($pkg): string
     {
-        $normalize = fn($v) => mb_strtolower(trim($v ?? ''), 'UTF-8');
-
-        $o = $pkg->originAddress;
-        $d = $pkg->destinationAddress;
-        $s = $pkg->service;
-
-        return implode('|', [
-            $normalize($pkg->package_type),
-            (string) $pkg->weight,
-            (string) $pkg->first_size,
-            (string) $pkg->second_size,
-            (string) $pkg->third_size,
-            $o ? $normalize($o->name) . '|' . $normalize($o->address) . '|' . $normalize($o->city) . '|' . $normalize($o->postal_code) : 'no-origin',
-            $d ? $normalize($d->name) . '|' . $normalize($d->address) . '|' . $normalize($d->city) . '|' . $normalize($d->postal_code) : 'no-dest',
-            $s ? $normalize($s->service_type) : 'nessuno',
-        ]);
+        return CartService::buildMergeKey($pkg);
     }
 
     /**
@@ -186,9 +168,7 @@ class CartController extends Controller
 
             $master = $groupPackages[0];
             $masterQty = (int) $master->quantity;
-            $masterUnitPrice = $masterQty > 0
-                ? (int) round((int) $master->single_price / $masterQty)
-                : (int) $master->single_price;
+            $masterUnitPrice = CartService::unitPrice((int) $master->single_price, $masterQty);
 
             for ($i = 1; $i < count($groupPackages); $i++) {
                 $dup = $groupPackages[$i];
@@ -210,68 +190,11 @@ class CartController extends Controller
 
     /**
      * Raggruppa i pacchi per coppia di indirizzi identici E stesso servizio.
-     * Restituisce un array di gruppi, ognuno con gli ID dei pacchi che verranno uniti
-     * in una singola spedizione al momento della creazione dell'ordine.
-     * Pacchi con stessi indirizzi ma servizi diversi finiscono in gruppi separati.
-     *
-     * @param \Illuminate\Support\Collection $packages  Pacchi con originAddress, destinationAddress e service caricati
-     * @return array  Array di gruppi con: package_ids, count, origin_summary, destination_summary, service_type
+     * Delega a CartService::buildAddressGroups().
      */
     private function buildAddressGroups($packages): array
     {
-        if ($packages->isEmpty()) return [];
-
-        $groups = [];
-        $normalize = function ($value) {
-            return mb_strtolower(trim($value ?? ''), 'UTF-8');
-        };
-
-        foreach ($packages as $package) {
-            $origin = $package->originAddress;
-            $destination = $package->destinationAddress;
-            $serviceType = $package->service->service_type ?? 'Nessuno';
-
-            $originParts = $origin ? implode('|', [
-                $normalize($origin->name),
-                $normalize($origin->address),
-                $normalize($origin->address_number),
-                $normalize($origin->city),
-                $normalize($origin->postal_code),
-                $normalize($origin->province),
-            ]) : 'no-origin';
-
-            $destParts = $destination ? implode('|', [
-                $normalize($destination->name),
-                $normalize($destination->address),
-                $normalize($destination->address_number),
-                $normalize($destination->city),
-                $normalize($destination->postal_code),
-                $normalize($destination->province),
-            ]) : 'no-dest';
-
-            $servicePart = $normalize($serviceType);
-
-            $key = md5($originParts . '::' . $destParts . '::' . $servicePart);
-
-            if (!isset($groups[$key])) {
-                $groups[$key] = [
-                    'package_ids' => [],
-                    'count' => 0,
-                    'origin_summary' => $origin
-                        ? trim(($origin->name ?? '') . ' - ' . ($origin->city ?? ''))
-                        : '',
-                    'destination_summary' => $destination
-                        ? trim(($destination->name ?? '') . ' - ' . ($destination->city ?? ''))
-                        : '',
-                    'service_type' => $serviceType,
-                ];
-            }
-
-            $groups[$key]['package_ids'][] = $package->id;
-            $groups[$key]['count']++;
-        }
-
-        return array_values($groups);
+        return CartService::buildAddressGroups($packages);
     }
 
 
@@ -334,26 +257,15 @@ class CartController extends Controller
 
             // Aggiorniamo i servizi
             if (isset($data['services']) && $package->service) {
-                $servicesData = $this->normalizeServiceData($data['services']);
-                // PUDO: aggiorniamo i dati del punto di ritiro nel service_data
-                if (!empty($data['pudo']) && ($data['delivery_mode'] ?? 'home') === 'pudo') {
-                    $serviceData = $servicesData['service_data'] ?? $package->service->service_data ?? [];
-                    $serviceData['pudo'] = $data['pudo'];
-                    $serviceData['delivery_mode'] = 'pudo';
-                    $servicesData['service_data'] = $serviceData;
-                } elseif (($data['delivery_mode'] ?? null) === 'home') {
-                    // Se l'utente è tornato a domicilio, rimuoviamo i dati PUDO
-                    $serviceData = $servicesData['service_data'] ?? $package->service->service_data ?? [];
-                    unset($serviceData['pudo'], $serviceData['delivery_mode']);
-                    $servicesData['service_data'] = $serviceData;
-                }
+                $servicesData = CartService::normalizeServiceData($data['services']);
+                $servicesData = CartService::applyPudoData($servicesData, $data);
                 $package->service->update($servicesData);
             }
 
             // Aggiorniamo i dati dei pacchi (il primo pacco nel payload)
             if (isset($data['packages']) && count($data['packages']) > 0) {
                 $packageData = $data['packages'][0];
-                $singlePriceCents = (int) round(($packageData['single_price'] ?? 0) * 100);
+                $singlePriceCents = CartService::euroToCents($packageData['single_price'] ?? 0);
                 $newQty = (int) ($packageData['quantity'] ?? 1);
 
                 $package->update([
@@ -405,16 +317,10 @@ class CartController extends Controller
         // Creiamo i pacchi in una transazione (tutto o niente)
         $outPackages = DB::transaction(function() use ($data, $authId, $existingPackages) {
             // Prepariamo i dati dei servizi aggiuntivi
-            $servicesData = $this->normalizeServiceData($data['services']);
+            $servicesData = CartService::normalizeServiceData($data['services']);
 
             // PUDO: se l'utente ha scelto ritiro in un punto BRT, salviamo i dati nel service_data
-            // Quando l'ordine verra' creato, leggeremo pudo_id da qui per salvarlo su brt_pudo_id
-            if (!empty($data['pudo']) && ($data['delivery_mode'] ?? 'home') === 'pudo') {
-                $serviceData = $servicesData['service_data'] ?? [];
-                $serviceData['pudo'] = $data['pudo'];
-                $serviceData['delivery_mode'] = 'pudo';
-                $servicesData['service_data'] = $serviceData;
-            }
+            $servicesData = CartService::applyPudoData($servicesData, $data);
 
             $packages = [];
             $origin = null;
@@ -423,51 +329,42 @@ class CartController extends Controller
 
             foreach ($data['packages'] as $packageData) {
                 // Convertiamo il prezzo da euro a centesimi
-                $singlePriceCents = (int) round(($packageData['single_price'] ?? 0) * 100);
+                $singlePriceCents = CartService::euroToCents($packageData['single_price'] ?? 0);
                 $newQty = (int) ($packageData['quantity'] ?? 1);
 
                 // Calcoliamo il prezzo per singola unita' (prezzo per 1 pacco)
-                $unitPriceCents = $newQty > 0 ? (int) round($singlePriceCents / $newQty) : $singlePriceCents;
+                $unitPriceCents = CartService::unitPrice($singlePriceCents, $newQty);
 
                 // Controlliamo se esiste gia' un pacco identico nel carrello
                 // (stesso tipo, stesse dimensioni, stessi indirizzi)
-                $duplicate = $existingPackages->first(function ($existing) use ($packageData, $data, $servicesData) {
-                    // Stessa tipologia, peso e dimensioni
-                    $samePackage = $existing->package_type === $packageData['package_type']
-                        && (string) $existing->weight === (string) $packageData['weight']
-                        && (string) $existing->first_size === (string) $packageData['first_size']
-                        && (string) $existing->second_size === (string) $packageData['second_size']
-                        && (string) $existing->third_size === (string) $packageData['third_size'];
-
-                    // Stessi indirizzi
-                    $sameOrigin = $existing->originAddress
-                        && $existing->originAddress->city === ($data['origin_address']['city'] ?? '')
-                        && $existing->originAddress->postal_code === ($data['origin_address']['postal_code'] ?? '')
-                        && $existing->originAddress->name === ($data['origin_address']['name'] ?? '')
-                        && $existing->originAddress->address === ($data['origin_address']['address'] ?? '');
-
-                    $sameDest = $existing->destinationAddress
-                        && $existing->destinationAddress->city === ($data['destination_address']['city'] ?? '')
-                        && $existing->destinationAddress->postal_code === ($data['destination_address']['postal_code'] ?? '')
-                        && $existing->destinationAddress->name === ($data['destination_address']['name'] ?? '')
-                        && $existing->destinationAddress->address === ($data['destination_address']['address'] ?? '');
-
-                    // Stesso servizio
-                    $sameService = $existing->service
-                        && ($existing->service->service_type ?? 'Nessuno') === ($servicesData['service_type'] ?? 'Nessuno');
-
-                    return $samePackage && $sameOrigin && $sameDest && $sameService;
+                $newServiceSig = CartService::buildServiceSignatureFromArray(
+                    $servicesData['service_type'] ?? 'Nessuno',
+                    $servicesData['service_data'] ?? [],
+                );
+                $duplicate = $existingPackages->first(function ($existing) use ($packageData, $data, $servicesData, $newServiceSig) {
+                    if (!$existing->originAddress || !$existing->destinationAddress || !$existing->service) {
+                        return false;
+                    }
+                    return CartService::isDuplicate(
+                        $packageData,
+                        $data['origin_address'] ?? [],
+                        $data['destination_address'] ?? [],
+                        $newServiceSig,
+                        $existing->toArray(),
+                        $existing->originAddress->toArray(),
+                        $existing->destinationAddress->toArray(),
+                        CartService::buildServiceSignatureFromService($existing->service),
+                    );
                 });
 
                 if ($duplicate) {
                     // Se il pacco esiste gia', aumentiamo la quantita' e ricalcoliamo il prezzo totale
-                    $oldQty = (int) $duplicate->quantity;
-                    $existingUnitPrice = $oldQty > 0 ? (int) round((int) $duplicate->single_price / $oldQty) : $unitPriceCents;
-                    $updatedQty = $oldQty + $newQty;
-                    $duplicate->update([
-                        'quantity' => $updatedQty,
-                        'single_price' => $existingUnitPrice * $updatedQty,
-                    ]);
+                    $merged = CartService::mergeQuantity(
+                        (int) $duplicate->single_price,
+                        (int) $duplicate->quantity,
+                        $newQty,
+                    );
+                    $duplicate->update($merged);
                     $packages[] = $duplicate;
                 } else {
                     // Se e' un pacco nuovo, creiamo gli indirizzi e i servizi (solo una volta per gruppo)
@@ -532,18 +429,18 @@ class CartController extends Controller
         $newQty = (int) $request->quantity;
 
         // Calcoliamo il prezzo per singola unita' dividendo il prezzo totale per la vecchia quantita'
-        $unitPrice = (int) round((int) $package->single_price / $oldQty);
+        $unitPriceCents = CartService::unitPrice((int) $package->single_price, $oldQty);
 
         // Aggiorniamo la quantita' e il prezzo totale
         $package->update([
             'quantity' => $newQty,
-            'single_price' => $unitPrice * $newQty,
+            'single_price' => $unitPriceCents * $newQty,
         ]);
 
         return response()->json([
             'message' => 'Quantità aggiornata',
             'quantity' => $newQty,
-            'single_price' => $unitPrice * $newQty,
+            'single_price' => $unitPriceCents * $newQty,
         ]);
     }
 
@@ -602,9 +499,7 @@ class CartController extends Controller
                 // Il primo pacco diventa il "master", gli altri vengono eliminati
                 $master = $groupPackages[0];
                 $masterQty = (int) $master->quantity;
-                $masterUnitPrice = $masterQty > 0
-                    ? (int) round((int) $master->single_price / $masterQty)
-                    : (int) $master->single_price;
+                $masterUnitPrice = CartService::unitPrice((int) $master->single_price, $masterQty);
 
                 for ($i = 1; $i < count($groupPackages); $i++) {
                     $dup = $groupPackages[$i];
@@ -656,6 +551,22 @@ class CartController extends Controller
             ->delete();
 
         return response()->json(['message' => 'Carrello svuotato']);
+    }
+
+    // Delegato a CartService — mantenuti come wrapper per retrocompatibilita'
+    private function calculateGroupedServiceSurchargeCents($packages): int
+    {
+        return CartService::calculateGroupedSurchargeFromModels($packages);
+    }
+
+    private function buildServiceSignatureFromService(Service $service): string
+    {
+        return CartService::buildServiceSignatureFromService($service);
+    }
+
+    private function buildServiceSignatureFromArray(string $serviceType, array $serviceData = []): string
+    {
+        return CartService::buildServiceSignatureFromArray($serviceType, $serviceData);
     }
 
 }

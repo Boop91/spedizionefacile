@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT_DIR="${ROOT_DIR}/tmp-diagnostica"
+source "${ROOT_DIR}/scripts/tooling/runtime-env.sh"
+REPORT_DIR="${ROOT_DIR}/reports/runtime/diagnostica"
 REPORT_FILE="${REPORT_DIR}/report.txt"
 
 mkdir -p "$REPORT_DIR"
@@ -14,10 +15,10 @@ mkdir -p "$REPORT_DIR"
   echo
 
   echo "[1] Versioni strumenti"
-  echo "- php: $(php -v 2>/dev/null | head -n 1 || echo 'non trovato')"
-  echo "- composer: $(composer --version 2>/dev/null || echo 'non trovato')"
-  echo "- node: $(node -v 2>/dev/null || echo 'non trovato')"
-  echo "- npm: $(npm -v 2>/dev/null || echo 'non trovato')"
+  echo "- php: $(php_version_line)"
+  echo "- composer: $(composer_version_line)"
+  echo "- node: $(node_runtime_line)"
+  echo "- npm: $(npm_runtime_line)"
   echo "- cloudflared: $(cloudflared --version 2>/dev/null | head -n 1 || echo 'non trovato')"
   echo
 
@@ -26,11 +27,12 @@ mkdir -p "$REPORT_DIR"
   echo
 
   echo "[3] Porte locali"
-  (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || true) | rg ":(3000|8000|8787)" || true
+  (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || true) | rg ":(3000|3001|8000|8787)" || true
   echo
 
   echo "[4] Endpoint locali"
   echo "- frontend (3000):"; curl -sS -I http://127.0.0.1:3000 | head -n 1 || true
+  echo "- frontend (3001):"; curl -sS -I http://127.0.0.1:3001 | head -n 1 || true
   echo "- backend (8000):"; curl -sS -I http://127.0.0.1:8000 | head -n 1 || true
   echo "- endpoint 8787 (Caddy oppure metrics cloudflared):"; curl -sS -I http://127.0.0.1:8787 | head -n 1 || true
   echo

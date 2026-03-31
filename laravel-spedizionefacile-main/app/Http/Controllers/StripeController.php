@@ -1,12 +1,13 @@
 <?php
+
 /**
  * FILE: StripeController.php
  * SCOPO: Gestisce tutti i pagamenti Stripe, la creazione ordini dal carrello e le carte salvate.
  *
  * DOVE SI USA: Checkout, gestione carte, conferma pagamento, pannello ordini
  *
- * DATI IN INGRESSO:
- *   - createOrder(): {subtotal?, package_ids?: [1,2,3]}
+     * DATI IN INGRESSO:
+     *   - createOrder(): {subtotal?, package_ids?: [1,2,3], billing_data?: {...}}
  *   - createPaymentIntent(): {order_id: 42}
  *   - orderPaid(): {order_id: 42, ext_id: "pi_xxx", is_existing_order?: false}
  *   - markOrderCompleted(): {order_id, payment_type: "wallet"|"bonifico", ext_id?, is_existing_order?}
@@ -46,21 +47,23 @@
 
 namespace App\Http\Controllers;
 
-use Stripe\Stripe;
-use App\Models\User;
-use Stripe\Customer;
+use App\Events\OrderPaid;
 use App\Models\Order;
-use App\Models\Coupon;
 use App\Models\Package;
 use App\Models\Setting;
-use Stripe\SetupIntent;
-use Stripe\StripeClient;
-use Stripe\PaymentIntent;
-use Stripe\PaymentMethod;
 use App\Models\Transaction;
-use App\Events\OrderPaid;
+use App\Models\User;
+use App\Services\ShipmentServicePricingService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Stripe\Customer;
+use Stripe\PaymentIntent;
+use Stripe\SetupIntent;
+use Stripe\Stripe;
+use Stripe\StripeClient;
+
 class StripeController extends Controller
 {
     /**
@@ -74,12 +77,24 @@ class StripeController extends Controller
             ?: config('services.stripe.secret');
     }
 
+    private function ensureOrderOwnership(Order $order, ?int $userId = null)
+    {
+        $ownerId = $userId ?? auth()->id();
+
+        if ((int) $order->user_id === (int) $ownerId) {
+            return null;
+        }
+
+        return response()->json(['error' => 'Non autorizzato.'], 403);
+    }
+
     /**
      * Segna un ordine come completato per pagamenti NON Stripe (portafoglio o bonifico).
      * Quando l'utente paga con il portafoglio, il pagamento e' immediato.
      * Quando paga con bonifico, l'ordine resta in "attesa" finche' l'admin non lo conferma.
      */
-    public function markOrderCompleted(Request $request) {
+    public function markOrderCompleted(Request $request)
+    {
         $request->validate([
             'order_id' => 'required|integer',
             'payment_type' => 'required|string|in:wallet,bonifico',
@@ -90,8 +105,8 @@ class StripeController extends Controller
         $order = Order::findOrFail($request->order_id);
 
         // Controllo di sicurezza: solo il proprietario dell'ordine puo' confermarlo
-        if ($order->user_id !== auth()->id()) {
-            return response()->json(['error' => 'Non autorizzato.'], 403);
+        if ($unauthorized = $this->ensureOrderOwnership($order)) {
+            return $unauthorized;
         }
 
         // Se paga con bonifico, l'ordine resta in attesa; se paga con portafoglio, e' completato subito
@@ -103,7 +118,7 @@ class StripeController extends Controller
         // Registriamo la transazione nel database
         $transaction = Transaction::create([
             'order_id' => $order->id,
-            'ext_id' => $request->ext_id ?? ($request->payment_type . '_' . now()->timestamp),
+            'ext_id' => $request->ext_id ?? ($request->payment_type.'_'.now()->timestamp),
             'type' => $request->payment_type,
             'status' => $request->payment_type === 'bonifico' ? 'pending' : 'succeeded',
             'total' => $order->subtotal->amount(),
@@ -117,7 +132,7 @@ class StripeController extends Controller
 
         // Svuotiamo il carrello dopo il pagamento
         // (ma non se l'utente sta pagando un ordine esistente dalla lista ordini)
-        if ($request->payment_type !== 'bonifico' && !$request->boolean('is_existing_order')) {
+        if ($request->payment_type !== 'bonifico' && ! $request->boolean('is_existing_order')) {
             DB::table('cart_user')
                 ->where('user_id', auth()->id())
                 ->delete();
@@ -138,18 +153,20 @@ class StripeController extends Controller
      *   Per aggiungere un campo all'ordine, aggiungerlo in Order::create().
      * COSA EVITARE: Non calcolare il subtotale dal frontend — usare sempre sum(single_price) lato server.
      */
-    public function createOrder(Request $request) {
+    public function createOrder(Request $request)
+    {
         $request->validate([
             'subtotal' => 'nullable|numeric',
             'package_ids' => 'nullable|array',
             'package_ids.*' => 'integer',
+            'billing_data' => 'nullable|array',
         ]);
 
         $userId = auth()->id();
 
         // Se sono stati specificati degli ID pacchi, creiamo l'ordine solo per quelli
         // (usato quando l'utente clicca "Paga ora" su una singola spedizione)
-        if ($request->has('package_ids') && !empty($request->package_ids)) {
+        if ($request->has('package_ids') && ! empty($request->package_ids)) {
             $packages = Package::with(['originAddress', 'destinationAddress', 'service'])
                 ->where('user_id', $userId)
                 ->whereIn('id', $request->package_ids)
@@ -174,39 +191,43 @@ class StripeController extends Controller
         // Pacchi con stessi indirizzi ma servizi diversi diventano ordini separati
         $groups = $this->groupPackagesByAddress($packages);
 
-        $orders = DB::transaction(function () use ($groups, $userId) {
+        $billingData = $request->input('billing_data');
+
+        $orders = DB::transaction(function () use ($groups, $userId, $billingData) {
+            $servicePricing = app(ShipmentServicePricingService::class);
             $orders = [];
 
             foreach ($groups as $group) {
                 $groupPackages = $group['packages'];
+                $groupService = $groupPackages->first()?->service;
+                $serviceType = $groupService->service_type ?? '';
+                $serviceData = $groupService->service_data ?? [];
+                $smsEmailNotification = (bool) ($serviceData['sms_email_notification'] ?? false);
 
                 // Calcoliamo il subtotale lato server sommando i prezzi di tutti i pacchi del gruppo
                 $subtotal = $groupPackages->sum(function ($pkg) {
                     return (int) $pkg->single_price;
                 });
-
+                $subtotal += $servicePricing->calculateSurchargeCents($serviceType, $serviceData, $smsEmailNotification, [
+                    'packages' => $groupPackages->all(),
+                    'origin_address' => $groupPackages->first()?->originAddress?->toArray() ?? [],
+                    'destination_address' => (($serviceData['delivery_mode'] ?? 'home') === 'pudo' && ! empty($serviceData['pudo']))
+                        ? $serviceData['pudo']
+                        : ($groupPackages->first()?->destinationAddress?->toArray() ?? []),
+                    'delivery_mode' => $serviceData['delivery_mode'] ?? 'home',
+                    'selected_pudo' => $serviceData['pudo'] ?? null,
+                    'requires_manual_quote' => (bool) ($serviceData['requires_manual_quote'] ?? false),
+                ]);
                 // Controlliamo se tra i pacchi del gruppo c'e' il servizio Contrassegno
-                $isCod = false;
-                $codAmount = null;
-                foreach ($groupPackages as $pkg) {
-                    $serviceType = $pkg->service->service_type ?? '';
-                    if (str_contains($serviceType, 'Contrassegno')) {
-                        $isCod = true;
-                        $serviceData = $pkg->service->service_data ?? [];
-                        $importo = $serviceData['Contrassegno']['importo'] ?? null;
-                        if ($importo) {
-                            $codAmount = (float) str_replace(',', '.', $importo);
-                        }
-                        break;
-                    }
-                }
+                $isCod = in_array('contrassegno', $servicePricing->normalizeSelectedServices($serviceType), true);
+                $codAmount = $isCod ? $servicePricing->extractContrassegnoAmount($serviceData) : null;
 
                 // PUDO: controlliamo se uno dei pacchi del gruppo ha un punto PUDO nel service_data
                 // Se presente, salviamo l'ID del punto nell'ordine per la spedizione BRT
                 $pudoId = null;
                 foreach ($groupPackages as $pkg) {
                     $sd = $pkg->service->service_data ?? [];
-                    if (!empty($sd['pudo']['pudo_id']) && ($sd['delivery_mode'] ?? '') === 'pudo') {
+                    if (! empty($sd['pudo']['pudo_id']) && ($sd['delivery_mode'] ?? '') === 'pudo') {
                         $pudoId = $sd['pudo']['pudo_id'];
                         break;
                     }
@@ -218,8 +239,9 @@ class StripeController extends Controller
                     'subtotal' => $subtotal,
                     'status' => Order::PENDING,
                     'is_cod' => $isCod,
-                    'cod_amount' => $codAmount,
+                    'cod_amount' => $codAmount > 0 ? $codAmount : null,
                     'brt_pudo_id' => $pudoId,
+                    'billing_data' => $billingData,
                 ]);
 
                 // Colleghiamo i pacchi all'ordine
@@ -243,7 +265,7 @@ class StripeController extends Controller
         // Se ci sono piu' ordini (indirizzi diversi), restituisci tutti gli ID
         return response()->json([
             'order_id' => $orders[0]->id,
-            'order_ids' => array_map(fn($o) => $o->id, $orders),
+            'order_ids' => array_map(fn ($o) => $o->id, $orders),
             'merged_count' => count($orders),
         ]);
     }
@@ -253,18 +275,22 @@ class StripeController extends Controller
      * Due pacchi vengono uniti solo se condividono: stessi indirizzi (partenza + destinazione) E stesso service_type.
      * Pacchi con stessi indirizzi ma servizi diversi generano ordini separati (etichette BRT diverse).
      *
-     * @param \Illuminate\Support\Collection $packages  Pacchi con originAddress, destinationAddress e service caricati
-     * @return array  Array di gruppi, ogni gruppo ha 'key' (hash) e 'packages' (Collection)
+     * @param  Collection  $packages  Pacchi con originAddress, destinationAddress e service caricati
+     * @return array Array di gruppi, ogni gruppo ha 'key' (hash) e 'packages' (Collection)
      */
     private function groupPackagesByAddress($packages): array
     {
+        $servicePricing = app(ShipmentServicePricingService::class);
         $groups = [];
 
         foreach ($packages as $package) {
             $serviceType = $package->service->service_type ?? 'Nessuno';
-            $key = $this->buildAddressKey($package->originAddress, $package->destinationAddress, $serviceType);
+            $serviceData = $package->service->service_data ?? [];
+            $smsEmailNotification = (bool) ($serviceData['sms_email_notification'] ?? false);
+            $serviceSignature = $servicePricing->buildSelectionSignature($serviceType, $serviceData, $smsEmailNotification);
+            $key = $this->buildAddressKey($package->originAddress, $package->destinationAddress, $serviceType, $serviceSignature);
 
-            if (!isset($groups[$key])) {
+            if (! isset($groups[$key])) {
                 $groups[$key] = [
                     'key' => $key,
                     'packages' => collect(),
@@ -282,7 +308,7 @@ class StripeController extends Controller
      * Normalizza i campi in minuscolo e rimuove gli spazi per confronto case-insensitive.
      * Include il service_type nella chiave: pacchi con servizi diversi non vengono mai uniti.
      */
-    private function buildAddressKey($origin, $destination, string $serviceType = 'Nessuno'): string
+    private function buildAddressKey($origin, $destination, string $serviceType = 'Nessuno', ?string $serviceSignature = null): string
     {
         $normalize = function ($value) {
             return mb_strtolower(trim($value ?? ''), 'UTF-8');
@@ -308,12 +334,13 @@ class StripeController extends Controller
 
         $servicePart = $normalize($serviceType);
 
-        return md5($originParts . '::' . $destParts . '::' . $servicePart);
+        return md5($originParts.'::'.$destParts.'::'.$servicePart.'::'.($serviceSignature ?? ''));
     }
 
     // Crea e conferma un pagamento Stripe usando una carta gia' salvata
     // Usato per pagamenti "off-session" (senza interazione dell'utente)
-    public function createPayment(Request $request) {
+    public function createPayment(Request $request)
+    {
         $request->validate([
             'order_id' => 'required|integer',
             'currency' => 'required|string',
@@ -323,8 +350,8 @@ class StripeController extends Controller
 
         $order = Order::findOrFail($request->order_id);
 
-        if ($order->user_id !== auth()->id()) {
-            return response()->json(['error' => 'Non autorizzato.'], 403);
+        if ($unauthorized = $this->ensureOrderOwnership($order)) {
+            return $unauthorized;
         }
 
         $stripe = new StripeClient($this->getStripeSecret());
@@ -332,12 +359,12 @@ class StripeController extends Controller
         // Creiamo il pagamento su Stripe con conferma immediata
         $paymentIntent = $stripe->paymentIntents->create([
             'amount' => $order->subtotal->amount(), // Importo in centesimi
-            'currency' => $request->currency,
-            'customer' => $request->customer_id,
-            'payment_method' => $request->payment_method_id,
+            'currency' => (string) $request->currency,
+            'customer' => (string) $request->customer_id,
+            'payment_method' => (string) $request->payment_method_id,
             'confirm' => true,           // Conferma subito il pagamento
             'off_session' => true,       // Non richiede interazione dell'utente
-            'metadata' => ['order_id' => $order->id],
+            'metadata' => ['order_id' => (string) $order->id],
         ]);
 
         // Salviamo i dati di pagamento per eventuali rimborsi futuri
@@ -353,7 +380,8 @@ class StripeController extends Controller
 
     // Crea un "PaymentIntent" (intenzione di pagamento) per il checkout con carta
     // Questo e' il primo passo del pagamento con Stripe: prepara tutto, poi il frontend completa
-    public function createPaymentIntent(Request $request) {
+    public function createPaymentIntent(Request $request)
+    {
         $request->validate([
             'order_id' => 'required|integer',
         ]);
@@ -361,12 +389,12 @@ class StripeController extends Controller
         $order = Order::findOrFail($request->order_id);
         $user = $request->user();
 
-        if ($order->user_id !== $user->id) {
-            return response()->json(['error' => 'Non autorizzato.'], 403);
+        if ($unauthorized = $this->ensureOrderOwnership($order, $user?->id)) {
+            return $unauthorized;
         }
 
         $secret = $this->getStripeSecret();
-        if (!$secret) {
+        if (! $secret) {
             return response()->json(['error' => 'Stripe non configurato.'], 503);
         }
 
@@ -386,8 +414,8 @@ class StripeController extends Controller
             $paymentIntent = $stripe->paymentIntents->create([
                 'amount' => $amount,
                 'currency' => 'eur',
-                'customer' => $customerId,
-                'metadata' => ['order_id' => $order->id],
+                'customer' => (string) $customerId,
+                'metadata' => ['order_id' => (string) $order->id],
                 'automatic_payment_methods' => ['enabled' => true],
             ]);
 
@@ -396,7 +424,8 @@ class StripeController extends Controller
                 'payment_intent_id' => $paymentIntent->id,
             ]);
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('PaymentIntent creation error', ['error' => $e->getMessage()]);
+            Log::error('PaymentIntent creation error', ['error' => $e->getMessage()]);
+
             return response()->json(['error' => 'Errore durante la creazione del pagamento. Riprova.'], 500);
         }
     }
@@ -411,7 +440,8 @@ class StripeController extends Controller
      * COME MODIFICARLO: Per aggiungere verifiche, inserirle prima dell'aggiornamento stato.
      * COSA EVITARE: Non rimuovere la verifica importo — senza, un utente potrebbe pagare meno del dovuto.
      */
-    public function orderPaid(Request $request) {
+    public function orderPaid(Request $request)
+    {
         $stripe = new StripeClient($this->getStripeSecret());
 
         // Recuperiamo da Stripe i dettagli del pagamento per verificare che sia reale
@@ -419,8 +449,8 @@ class StripeController extends Controller
 
         $order = Order::findOrFail($request->order_id);
 
-        if ($order->user_id !== auth()->id()) {
-            return response()->json(['error' => 'Non autorizzato.'], 403);
+        if ($unauthorized = $this->ensureOrderOwnership($order)) {
+            return $unauthorized;
         }
 
         // Verifica di sicurezza: controlliamo che il pagamento corrisponda a questo ordine
@@ -467,7 +497,7 @@ class StripeController extends Controller
         event(new OrderPaid($order, $transaction));
 
         // Svuotiamo il carrello (ma non se sta pagando un ordine esistente dalla lista)
-        if (!$request->boolean('is_existing_order')) {
+        if (! $request->boolean('is_existing_order')) {
             DB::table('cart_user')
                 ->where('user_id', auth()->id())
                 ->delete();
@@ -476,17 +506,17 @@ class StripeController extends Controller
         return response()->json(['success' => true]);
     }
 
-
     // Crea un profilo cliente su Stripe per l'utente, o restituisce quello esistente
     // Stripe richiede un "Customer" per associare carte di pagamento e pagamenti
-    public function createOrGetCustomer(User $user) {
+    public function createOrGetCustomer(User $user)
+    {
         $stripe = new StripeClient($this->getStripeSecret());
 
         // Se l'utente non ha ancora un profilo cliente su Stripe, lo creiamo
-        if (!$user->customer_id) {
+        if (! $user->customer_id) {
             $customer = $stripe->customers->create([
                 'email' => $user->email,
-                'name'  => $user->name . ' ' . $user->surname,
+                'name' => $user->name.' '.$user->surname,
             ]);
 
             $user->customer_id = $customer->id;
@@ -496,14 +526,14 @@ class StripeController extends Controller
         return $user->customer_id;
     }
 
-
     // Crea un "SetupIntent" per salvare una nuova carta di credito
     // Il SetupIntent permette di salvare la carta senza fare un pagamento
     // (la carta viene salvata per essere usata in futuro)
-    public function createSetupIntent(Request $request) {
+    public function createSetupIntent(Request $request)
+    {
         $secret = $this->getStripeSecret();
 
-        if (!$secret) {
+        if (! $secret) {
             return response()->json(['error' => 'Stripe non configurato. Vai nelle impostazioni per inserire le chiavi API.'], 503);
         }
 
@@ -519,23 +549,24 @@ class StripeController extends Controller
             ]);
 
             return response()->json([
-                'client_secret' => $intent->client_secret // Il frontend usa questo per mostrare il modulo carta
+                'client_secret' => $intent->client_secret, // Il frontend usa questo per mostrare il modulo carta
             ]);
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('SetupIntent creation error', ['error' => $e->getMessage()]);
+            Log::error('SetupIntent creation error', ['error' => $e->getMessage()]);
+
             return response()->json(['error' => 'Errore durante la configurazione del metodo di pagamento. Riprova.'], 500);
         }
     }
 
-
     // Mostra la lista di tutte le carte di credito salvate dall'utente
     // Per ogni carta mostra: marca (Visa, Mastercard), ultime 4 cifre, scadenza, se e' quella predefinita
-    public function listPaymentMethods(Request $request) {
+    public function listPaymentMethods(Request $request)
+    {
         $user = $request->user();
         $secret = $this->getStripeSecret();
 
         // Se l'utente non ha un profilo Stripe o Stripe non e' configurato, restituiamo una lista vuota
-        if (!$user->customer_id || !$secret) {
+        if (! $user->customer_id || ! $secret) {
             return response()->json(['data' => [], 'default' => null]);
         }
 
@@ -565,7 +596,7 @@ class StripeController extends Controller
         }, $pmList->data);
 
         // Mettiamo la carta predefinita in cima alla lista
-        usort($cards, fn($a, $b) => $b['default'] <=> $a['default']);
+        usort($cards, fn ($a, $b) => $b['default'] <=> $a['default']);
 
         return response()->json([
             'data' => $cards,
@@ -573,17 +604,17 @@ class StripeController extends Controller
         ]);
     }
 
-
     // Imposta una carta come metodo di pagamento predefinito
     // Prima collega la carta al cliente Stripe, poi la imposta come predefinita
-    public function setDefaultPaymentMethod(Request $request) {
+    public function setDefaultPaymentMethod(Request $request)
+    {
         $request->validate([
-            'payment_method' => 'required|string'
+            'payment_method' => 'required|string',
         ]);
 
         $user = $request->user();
 
-        if (!$user->customer_id) {
+        if (! $user->customer_id) {
             return response()->json(['error' => 'No Stripe customer'], 400);
         }
 
@@ -594,19 +625,19 @@ class StripeController extends Controller
         try {
             // Colleghiamo la carta al cliente Stripe (se non e' gia' collegata)
             $stripe->paymentMethods->attach($paymentMethodId, [
-                'customer' => $user->customer_id
+                'customer' => $user->customer_id,
             ]);
 
             // Impostiamo la carta come predefinita
             $stripe->customers->update($user->customer_id, [
                 'invoice_settings' => [
-                    'default_payment_method' => $paymentMethodId
-                ]
+                    'default_payment_method' => $paymentMethodId,
+                ],
             ]);
 
             return response()->json([
                 'success' => true,
-                'default' => $paymentMethodId
+                'default' => $paymentMethodId,
             ]);
 
         } catch (\Exception $e) {
@@ -614,16 +645,16 @@ class StripeController extends Controller
         }
     }
 
-
     // Cambia la carta predefinita (per carte gia' collegate al cliente)
-    public function changeDefaultPaymentMethod(Request $request) {
+    public function changeDefaultPaymentMethod(Request $request)
+    {
         $request->validate([
-            'payment_method_id' => 'required|string'
+            'payment_method_id' => 'required|string',
         ]);
 
         $user = $request->user();
 
-        if (!$user->customer_id) {
+        if (! $user->customer_id) {
             return response()->json(['error' => 'No Stripe customer'], 400);
         }
 
@@ -639,7 +670,7 @@ class StripeController extends Controller
 
             return response()->json([
                 'success' => true,
-                'default' => $customer->invoice_settings->default_payment_method
+                'default' => $customer->invoice_settings->default_payment_method,
             ]);
 
         } catch (\Exception $e) {
@@ -649,13 +680,14 @@ class StripeController extends Controller
 
     // Elimina una carta di credito salvata dall'account dell'utente
     // SICUREZZA: verifica che la carta appartenga al cliente Stripe dell'utente loggato
-    public function deleteCard(Request $request) {
+    public function deleteCard(Request $request)
+    {
 
         $request->validate(['payment_method_id' => 'required|string']);
 
         $user = $request->user();
 
-        if (!$user->customer_id) {
+        if (! $user->customer_id) {
             return response()->json(['error' => 'Nessun profilo Stripe associato.'], 400);
         }
 
@@ -680,11 +712,12 @@ class StripeController extends Controller
 
     // Recupera i dettagli della carta predefinita dell'utente
     // Usato dal frontend per mostrare quale carta verra' usata per il pagamento
-    public function getDefaultPaymentMethod(Request $request) {
+    public function getDefaultPaymentMethod(Request $request)
+    {
         $user = $request->user();
         $secret = $this->getStripeSecret();
 
-        if (!$user->customer_id || !$secret) {
+        if (! $user->customer_id || ! $secret) {
             return response()->json(['card' => null]);
         }
 
@@ -694,7 +727,7 @@ class StripeController extends Controller
         $customer = $stripe->customers->retrieve($user->customer_id);
         $defaultPm = $customer->invoice_settings->default_payment_method ?? null;
 
-        if (!$defaultPm) {
+        if (! $defaultPm) {
             return response()->json(['card' => null]);
         }
 
@@ -713,6 +746,4 @@ class StripeController extends Controller
 
         return response()->json(['card' => $card]);
     }
-
-
 }

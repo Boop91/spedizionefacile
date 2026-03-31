@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_DIR}/scripts/tooling/runtime-env.sh"
 
 resolve_project_dir() {
   local preferred="$1"
@@ -36,6 +37,7 @@ fi
 
 NUXT_PORT="${NUXT_PORT:-3001}"
 LARAVEL_PORT="${LARAVEL_PORT:-8000}"
+NUXT_NODE_OPTIONS="${NUXT_NODE_OPTIONS:---max-old-space-size=6144}"
 
 if [[ -z "${NUXT_PUBLIC_API_BASE:-}" ]]; then
   if [[ -n "${CODESPACE_NAME:-}" && -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]]; then
@@ -45,15 +47,15 @@ if [[ -z "${NUXT_PUBLIC_API_BASE:-}" ]]; then
   fi
 fi
 
-if ! command -v composer >/dev/null 2>&1; then
-  echo "Composer non disponibile nel container."
+if ! resolve_composer_phar >/dev/null 2>&1 && ! { command -v composer >/dev/null 2>&1 && command -v php >/dev/null 2>&1; }; then
+  echo "Composer non disponibile. Installa Composer o rendi disponibile /mnt/c/composer/composer.phar."
   exit 1
 fi
 
 if [[ -f "${LARAVEL_DIR}/composer.json" ]]; then
   if [[ ! -f "${LARAVEL_DIR}/vendor/autoload.php" ]]; then
-    (cd "${LARAVEL_DIR}" && composer install --no-interaction --prefer-dist --no-dev --ignore-platform-req=ext-bcmath) || \
-    (cd "${LARAVEL_DIR}" && composer install --no-interaction --prefer-dist --no-dev --ignore-platform-reqs)
+    (cd "${LARAVEL_DIR}" && run_composer_cmd install --no-interaction --prefer-dist --no-dev --ignore-platform-req=ext-bcmath) || \
+    (cd "${LARAVEL_DIR}" && run_composer_cmd install --no-interaction --prefer-dist --no-dev --ignore-platform-reqs)
   fi
 fi
 
@@ -63,6 +65,8 @@ fi
 
 if [[ -f "${LARAVEL_DIR}/.env" ]]; then
   DB_PATH="${LARAVEL_DIR}/database/database.sqlite"
+  DB_PATH_NATIVE="$(to_native_path "${DB_PATH}")"
+  DB_PATH_ENV="${DB_PATH_NATIVE//\\//}"
   touch "${DB_PATH}"
   set_env_value() {
     local key="$1"
@@ -74,15 +78,15 @@ if [[ -f "${LARAVEL_DIR}/.env" ]]; then
     fi
   }
   set_env_value "DB_CONNECTION" "sqlite"
-  set_env_value "DB_DATABASE" "${DB_PATH}"
+  set_env_value "DB_DATABASE" "${DB_PATH_ENV}"
   set_env_value "SESSION_DRIVER" "file"
   set_env_value "QUEUE_CONNECTION" "sync"
   if ! grep -q "^APP_KEY=base64:" "${LARAVEL_DIR}/.env"; then
-    (cd "${LARAVEL_DIR}" && php artisan key:generate --force)
+    (cd "${LARAVEL_DIR}" && run_php_cmd artisan key:generate --force)
   fi
 
   # Ensure Sanctum/CORS include direct API port
-  STATEFUL_DOMAINS="127.0.0.1:8787,localhost:8787,127.0.0.1:${NUXT_PORT},localhost:${NUXT_PORT},127.0.0.1:${LARAVEL_PORT},localhost:${LARAVEL_PORT}"
+  STATEFUL_DOMAINS="127.0.0.1:8787,localhost:8787,127.0.0.1:${NUXT_PORT},localhost:${NUXT_PORT},127.0.0.1:${LARAVEL_PORT},localhost:${LARAVEL_PORT},*.trycloudflare.com"
   CORS_ORIGINS="http://127.0.0.1:8787,http://localhost:8787,http://127.0.0.1:${NUXT_PORT},http://localhost:${NUXT_PORT},http://127.0.0.1:${LARAVEL_PORT},http://localhost:${LARAVEL_PORT}"
 
   if grep -q "^SANCTUM_STATEFUL_DOMAINS=" "${LARAVEL_DIR}/.env"; then
@@ -104,31 +108,33 @@ if [[ -f "${LARAVEL_DIR}/.env" ]]; then
   fi
 
   # Run migrations (idempotent)
-  (cd "${LARAVEL_DIR}" && php artisan migrate --force 2>/dev/null || true)
+  (cd "${LARAVEL_DIR}" && run_php_cmd artisan migrate --force 2>/dev/null || true)
   # Ensure default demo accounts exist and are verified
-  (cd "${LARAVEL_DIR}" && php artisan db:seed --class=Database\\Seeders\\DatabaseSeeder --force 2>/dev/null || true)
+  (cd "${LARAVEL_DIR}" && run_php_cmd artisan db:seed --class=Database\\Seeders\\DatabaseSeeder --force 2>/dev/null || true)
+  # Populate Italian locations only when the table is still empty.
+  (cd "${LARAVEL_DIR}" && run_php_cmd artisan locations:import --if-empty --country=IT >/tmp/locations-import.log 2>&1 || true)
 fi
 
 if [[ -f "${NUXT_DIR}/package.json" ]]; then
   if [[ ! -d "${NUXT_DIR}/node_modules" ]]; then
-    (cd "${NUXT_DIR}" && npm install)
+    (cd "${NUXT_DIR}" && run_npm20 install --include=optional)
   else
-    (cd "${NUXT_DIR}" && npm install --prefer-offline --no-audit >/tmp/nuxt-npm-install.log 2>&1 || true)
+    (cd "${NUXT_DIR}" && run_npm20 install --prefer-offline --no-audit --include=optional >/tmp/nuxt-npm-install.log 2>&1 || true)
   fi
 fi
 
 if [[ "${SKIP_LARAVEL_START:-0}" != "1" ]]; then
   if ! pgrep -f "artisan serve --host 0.0.0.0 --port ${LARAVEL_PORT}" >/dev/null 2>&1; then
-    (cd "${LARAVEL_DIR}" && php artisan serve --host 0.0.0.0 --port "${LARAVEL_PORT}" > /tmp/laravel.log 2>&1 &)
+    (cd "${LARAVEL_DIR}" && run_php_cmd artisan serve --host 0.0.0.0 --port "${LARAVEL_PORT}" > /tmp/laravel.log 2>&1 &)
   fi
 fi
 
 if [[ "${SKIP_NUXT_START:-0}" != "1" ]]; then
-  if ! pgrep -f "nuxt.*--port ${NUXT_PORT}" >/dev/null 2>&1; then
-    (cd "${NUXT_DIR}" && npm run dev -- --host 0.0.0.0 --port "${NUXT_PORT}" > /tmp/nuxt.log 2>&1 &)
-    sleep 4
-    if ! pgrep -f "nuxt.*--port ${NUXT_PORT}" >/dev/null 2>&1; then
-      (cd "${NUXT_DIR}" && npx nuxi dev --host 0.0.0.0 --port "${NUXT_PORT}" >> /tmp/nuxt.log 2>&1 &)
+  if ! pgrep -f "node .*nuxi\\.mjs dev.*--port ${NUXT_PORT}" >/dev/null 2>&1; then
+    (cd "${NUXT_DIR}" && NODE_OPTIONS="${NUXT_NODE_OPTIONS}" run_node20 "${NUXT_DIR}/node_modules/@nuxt/cli/bin/nuxi.mjs" dev --host 0.0.0.0 --port "${NUXT_PORT}" > /tmp/nuxt.log 2>&1 &)
+    sleep 6
+    if ! pgrep -f "node .*nuxi\\.mjs dev.*--port ${NUXT_PORT}" >/dev/null 2>&1; then
+      echo "Attenzione: Nuxt non risulta avviato. Controlla /tmp/nuxt.log"
     fi
   fi
 fi
@@ -138,3 +144,6 @@ echo "Nuxt port: ${NUXT_PORT}"
 echo "Laravel port: ${LARAVEL_PORT}"
 echo "Frontend dir: ${NUXT_DIR}"
 echo "Backend dir: ${LARAVEL_DIR}"
+echo "PHP runtime: $(php_version_line)"
+echo "Composer runtime: $(composer_version_line)"
+echo "Node runtime: $(node_runtime_line)"

@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Continue'
 
 $root = Split-Path -Parent $PSScriptRoot
-$reportDir = Join-Path $root 'tmp-diagnostica'
+$reportDir = Join-Path $root 'reports/runtime/diagnostica'
 $reportFile = Join-Path $reportDir 'report.txt'
 
 New-Item -ItemType Directory -Force $reportDir | Out-Null
@@ -18,11 +18,12 @@ $lines += "- node: $((node -v 2>$null) -join '')"
 $lines += "- npm: $((npm -v 2>$null) -join '')"
 $lines += "- cloudflared: $((cloudflared --version 2>$null | Select-Object -First 1) -join '')"
 $lines += ''
-$lines += '[2] Porte locali (3000/8000/8787)'
-$lines += (netstat -ano | Select-String ':3000|:8000|:8787' | ForEach-Object { $_.Line })
+$lines += '[2] Porte locali (3000/3001/8000/8787)'
+$lines += (netstat -ano | Select-String ':3000|:3001|:8000|:8787' | ForEach-Object { $_.Line })
 $lines += ''
 $lines += '[3] Endpoint locali'
 $lines += "- 3000: $((curl.exe -I http://127.0.0.1:3000 2>$null | Select-Object -First 1) -join '')"
+$lines += "- 3001: $((curl.exe -I http://127.0.0.1:3001 2>$null | Select-Object -First 1) -join '')"
 $lines += "- 8000: $((curl.exe -I http://127.0.0.1:8000 2>$null | Select-Object -First 1) -join '')"
 $lines += "- 8787: $((curl.exe -I http://127.0.0.1:8787 2>$null | Select-Object -First 1) -join '')"
 $lines += ''

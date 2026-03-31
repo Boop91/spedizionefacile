@@ -1,4 +1,5 @@
 <?php
+
 /**
  * FILE: BrtService.php
  * SCOPO: Comunicazione con le API BRT per spedizioni, etichette, tracking e punti PUDO.
@@ -11,7 +12,7 @@
  * DATI IN INGRESSO:
  *   - Order (con pacchi e indirizzi) per createShipment
  *     Esempio: $brt->createShipment($order, ['is_cod' => true, 'cod_amount' => 1500])
- *   - Options array: is_cod, cod_amount, pudo_id per opzioni spedizione
+ *   - Options array: is_cod, cod_amount, cod_payment_type (BM|CC|AS), pudo_id per opzioni spedizione
  *   - numericSenderReference (int) per confirmShipment, deleteShipment
  *   - Indirizzo o coordinate lat/lng per ricerca PUDO
  *
@@ -49,30 +50,40 @@
 namespace App\Services;
 
 use App\Models\Order;
-use App\Models\Location;
-use App\Models\PudoPoint;
+use App\Models\Package;
+use App\Services\Brt\AddressNormalizer;
+use App\Services\Brt\BrtConfig;
+use App\Services\Brt\ErrorTranslator;
+use App\Services\Brt\PudoService;
+use App\Services\Brt\TrackingService;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+
 class BrtService
 {
-    private string $apiUrl;        // Indirizzo base delle API BRT per le spedizioni
-    private string $pudoApiUrl;    // Indirizzo base delle API BRT per i punti PUDO
-    private string $clientId;      // Identificativo cliente BRT (come un "nome utente")
-    private string $password;      // Password per accedere alle API BRT
-    private string $pudoToken;     // Token di autenticazione per le API PUDO
-    private int $departureDepot;   // Codice del deposito BRT di partenza
-    private bool $verifySsl;       // Se verificare il certificato SSL (disabilitare solo in dev)
+    private string $apiUrl;
+    private string $clientId;
+    private string $password;
+    private int $departureDepot;
+    private bool $verifySsl;
 
-    // Quando viene creato il servizio, leggiamo tutte le configurazioni necessarie
+    private AddressNormalizer $addressNormalizer;
+    private ErrorTranslator $errorTranslator;
+    private PudoService $pudoService;
+    private TrackingService $trackingService;
+
     public function __construct()
     {
-        $this->apiUrl = config('services.brt.api_url', 'https://api.brt.it/rest/v1/shipments');
-        $this->pudoApiUrl = config('services.brt.pudo_api_url', 'https://api.brt.it');
-        $this->clientId = config('services.brt.client_id', '');
-        $this->password = config('services.brt.password', '');
-        $this->pudoToken = config('services.brt.pudo_token', '');
-        $this->departureDepot = (int) config('services.brt.departure_depot', 0);
-        $this->verifySsl = (bool) config('services.brt.verify_ssl', true);
+        $config = new BrtConfig();
+        $this->apiUrl = $config->apiUrl;
+        $this->clientId = $config->clientId;
+        $this->password = $config->password;
+        $this->departureDepot = $config->departureDepot;
+        $this->verifySsl = $config->verifySsl;
+        $this->addressNormalizer = new AddressNormalizer();
+        $this->errorTranslator = new ErrorTranslator();
+        $this->pudoService = new PudoService($config);
+        $this->trackingService = new TrackingService($config);
     }
 
     /**
@@ -98,9 +109,9 @@ class BrtService
      *   - Non loggare la password BRT (gia' mascherata nel log)
      *   - Non aumentare il timeout oltre 30s (BRT risponde tipicamente in 5-15s)
      *
-     * @param Order $order  L'ordine (con pacchi e indirizzi caricati)
-     * @param array $options  Opzioni aggiuntive: contrassegno (is_cod, cod_amount), punto PUDO, note
-     * @return array  Risultato con: success, parcel_id, label_base64, tracking_url, error
+     * @param  Order  $order  L'ordine (con pacchi e indirizzi caricati)
+     * @param  array  $options  Opzioni aggiuntive: contrassegno (is_cod, cod_amount), punto PUDO, note
+     * @return array Risultato con: success, parcel_id, label_base64, tracking_url, error
      */
     public function createShipment(Order $order, array $options = []): array
     {
@@ -109,39 +120,52 @@ class BrtService
 
         // Prendiamo il primo pacco dell'ordine (per gli indirizzi)
         $package = $order->packages->first();
-        if (!$package) {
+        if (! $package) {
             return ['success' => false, 'error' => 'Nessun collo trovato nell\'ordine.'];
         }
 
         $origin = $package->originAddress;
         $destination = $package->destinationAddress;
 
-        if (!$origin || !$destination) {
+        if (! $origin || ! $destination) {
             return ['success' => false, 'error' => 'Indirizzi di partenza o destinazione mancanti.'];
         }
 
-        // Calcoliamo il peso totale di tutti i pacchi dell'ordine
+        // Calcoliamo peso totale e dimensioni massime di tutti i pacchi
         $totalWeight = $order->packages->sum(function ($pkg) {
             return (float) preg_replace('/[^0-9.]/', '', $pkg->weight ?? '0');
         });
-        // Calcoliamo il numero totale di colli (pacchi)
         $totalParcels = $order->packages->sum(function ($pkg) {
             return max(1, (int) ($pkg->quantity ?? 1));
         });
+        // Dimensioni: BRT vuole la dimensione del collo piu' grande (cm)
+        $maxLength = $order->packages->max(fn ($pkg) => (int) ($pkg->first_size ?? 0));
+        $maxWidth = $order->packages->max(fn ($pkg) => (int) ($pkg->second_size ?? 0));
+        $maxHeight = $order->packages->max(fn ($pkg) => (int) ($pkg->third_size ?? 0));
 
         // Usiamo l'ID dell'ordine come riferimento numerico per BRT
         $numericSenderReference = $order->id;
 
         // Validazione dati obbligatori prima di inviare a BRT
         $missingFields = [];
-        if (empty(trim($destination->name ?? ''))) $missingFields[] = 'nome destinatario';
-        if (empty(trim(($destination->address ?? '') . ' ' . ($destination->address_number ?? '')))) $missingFields[] = 'indirizzo destinatario';
-        if (empty(trim($destination->postal_code ?? ''))) $missingFields[] = 'CAP destinatario';
-        if (empty(trim($destination->city ?? ''))) $missingFields[] = 'città destinatario';
-        if (empty(trim($destination->province ?? ''))) $missingFields[] = 'provincia destinatario';
+        if (empty(trim($destination->name ?? ''))) {
+            $missingFields[] = 'nome destinatario';
+        }
+        if (empty(trim(($destination->address ?? '').' '.($destination->address_number ?? '')))) {
+            $missingFields[] = 'indirizzo destinatario';
+        }
+        if (empty(trim($destination->postal_code ?? ''))) {
+            $missingFields[] = 'CAP destinatario';
+        }
+        if (empty(trim($destination->city ?? ''))) {
+            $missingFields[] = 'città destinatario';
+        }
+        if (empty(trim($destination->province ?? ''))) {
+            $missingFields[] = 'provincia destinatario';
+        }
 
-        if (!empty($missingFields)) {
-            return ['success' => false, 'error' => 'Dati mancanti per BRT: ' . implode(', ', $missingFields) . '.'];
+        if (! empty($missingFields)) {
+            return ['success' => false, 'error' => 'Dati mancanti per BRT: '.implode(', ', $missingFields).'.'];
         }
 
         // Normalizziamo i dati dell'indirizzo per il formato richiesto da BRT
@@ -155,15 +179,13 @@ class BrtService
                 'password' => $this->password,
             ],
             'createData' => [
-                // departureDepot: codice filiale BRT di partenza. Il valore 0 è placeholder,
-                // va configurato con il codice filiale reale assegnato da BRT (es. 53 per Milano).
-                // Contattare BRT per ottenere il codice filiale corretto.
-                'departureDepot' => $this->departureDepot,
+                // departureDepot: risolto automaticamente dal CAP mittente tramite config/brt_filiali.php
+                'departureDepot' => $this->resolveFilialeByCap($origin->postal_code ?? ''),
                 'senderCustomerCode' => (int) $this->clientId,
                 // 'network' rimosso: campo opzionale, stringa vuota causava errori di validazione BRT
                 'deliveryFreightTypeCode' => $options['delivery_freight_type'] ?? 'DAP', // DAP = consegnato a destinazione
                 'consigneeCompanyName' => $destination->name ?? '',          // Nome del destinatario
-                'consigneeAddress' => trim(($destination->address ?? '') . ' ' . ($destination->address_number ?? '')),
+                'consigneeAddress' => trim(($destination->address ?? '').' '.($destination->address_number ?? '')),
                 'consigneeZIPCode' => $normalizedDest['postal_code'],       // CAP (5 cifre, zero-padded)
                 'consigneeCity' => $normalizedDest['city'],                 // Citta' (MAIUSCOLO, normalizzata)
                 'consigneeProvinceAbbreviation' => $normalizedDest['province'], // Provincia (sigla a 2 lettere)
@@ -174,8 +196,11 @@ class BrtService
                 'consigneeMobilePhoneNumber' => $destination->telephone_number ?? '',
                 'numberOfParcels' => $totalParcels,                          // Numero di colli
                 'weightKG' => max(1, (int) ceil($totalWeight)),              // Peso in kg (minimo 1)
+                'packageLength' => max(1, $maxLength),                       // Lunghezza in cm
+                'packageWidth' => max(1, $maxWidth),                         // Larghezza in cm
+                'packageHeight' => max(1, $maxHeight),                       // Altezza in cm
                 'numericSenderReference' => $numericSenderReference,
-                'alphanumericSenderReference' => 'SF-' . str_pad($order->id, 6, '0', STR_PAD_LEFT), // Es. "SF-000042"
+                'alphanumericSenderReference' => 'SF-'.str_pad((string) $order->id, 6, '0', STR_PAD_LEFT), // Es. "SF-000042"
                 'notes' => $this->buildNotes($order, $options),
                 'isAlertRequired' => '1',        // Richiedi notifiche al destinatario
                 'isCODMandatory' => '0',         // Contrassegno non obbligatorio (di default)
@@ -193,15 +218,15 @@ class BrtService
 
         // Se la spedizione e' in contrassegno (pagamento alla consegna),
         // aggiungiamo i dati necessari
-        if (!empty($options['is_cod']) && !empty($options['cod_amount'])) {
+        if (! empty($options['is_cod']) && ! empty($options['cod_amount'])) {
             $payload['createData']['isCODMandatory'] = '1';
             $payload['createData']['cashOnDelivery'] = (float) ($options['cod_amount'] / 100); // Da centesimi a euro
-            $payload['createData']['codPaymentType'] = $options['cod_payment_type'] ?? 'BM';   // BM = Bollettino Postale
+            $payload['createData']['codPaymentType'] = $options['cod_payment_type'] ?? 'BM';   // BM = Bonifico bancario, CC = Assegno circolare, AS = Assegno bancario
             $payload['createData']['codCurrency'] = 'EUR';
         }
 
         // Se la consegna e' presso un punto PUDO, aggiungiamo l'ID del punto
-        if (!empty($options['pudo_id'])) {
+        if (! empty($options['pudo_id'])) {
             $payload['createData']['pudoId'] = $options['pudo_id'];
         }
 
@@ -221,7 +246,7 @@ class BrtService
             $response = Http::withOptions(['verify' => $this->verifySsl])
                 ->timeout(30)
                 ->withHeaders(['Content-Type' => 'application/json'])
-                ->post($this->apiUrl . '/shipment', $payload);
+                ->post($this->apiUrl.'/shipment', $payload);
 
             $body = $response->json();
             $rawBody = $response->body();
@@ -240,8 +265,9 @@ class BrtService
             ]);
 
             // Se la risposta HTTP non e' positiva, restituiamo l'errore
-            if (!$response->successful()) {
-                $errorMsg = $responseData['executionMessage']['message'] ?? 'Errore API BRT (HTTP ' . $response->status() . ')';
+            if (! $response->successful()) {
+                $errorMsg = $responseData['executionMessage']['message'] ?? 'Errore API BRT (HTTP '.$response->status().')';
+
                 return ['success' => false, 'error' => $errorMsg];
             }
 
@@ -269,6 +295,7 @@ class BrtService
                         'departureDepot' => $payload['createData']['departureDepot'] ?? 0,
                     ],
                 ]);
+
                 return ['success' => false, 'error' => $errorMsg];
             }
 
@@ -277,7 +304,7 @@ class BrtService
             $parcelId = '';
             $labelBase64 = '';
             $labels = $responseData['labels']['label'] ?? $responseData['labels'] ?? [];
-            if (!empty($labels) && is_array($labels)) {
+            if (! empty($labels) && is_array($labels)) {
                 $firstLabel = $labels[0] ?? null;
                 if ($firstLabel) {
                     $parcelId = $firstLabel['parcelID'] ?? $firstLabel['parcelId'] ?? '';
@@ -304,7 +331,7 @@ class BrtService
             // che accetta il numero di collo (parcelNumber) come riferimento
             $trackingUrl = '';
             if ($trackingNumber) {
-                $trackingUrl = 'https://vas.brt.it/vas/sped_det_show.hsm?refnr=' . urlencode($trackingNumber) . '&tiession=';
+                $trackingUrl = 'https://vas.brt.it/vas/sped_det_show.hsm?refnr='.urlencode($trackingNumber).'&tiession=';
             }
 
             Log::info('BRT createShipment tracking data extracted', [
@@ -344,7 +371,8 @@ class BrtService
                 'order_id' => $order->id,
                 'error' => $e->getMessage(),
             ]);
-            return ['success' => false, 'error' => 'Errore di connessione BRT: ' . $e->getMessage()];
+
+            return ['success' => false, 'error' => 'Errore di connessione BRT: '.$e->getMessage()];
         }
     }
 
@@ -386,7 +414,7 @@ class BrtService
                 'numberOfParcels' => (int) ($data['parcels'] ?? 1),
                 'weightKG' => max(1, (int) ($data['weight_kg'] ?? 1)),
                 'numericSenderReference' => $numericSenderReference,
-                'alphanumericSenderReference' => 'TEST-' . $numericSenderReference,
+                'alphanumericSenderReference' => 'TEST-'.$numericSenderReference,
                 'notes' => $data['notes'] ?? 'Test SpediamoFacile',
                 'isAlertRequired' => '1',
                 'isCODMandatory' => '0',
@@ -408,7 +436,7 @@ class BrtService
             $response = Http::withOptions(['verify' => $this->verifySsl])
                 ->timeout(30)
                 ->withHeaders(['Content-Type' => 'application/json'])
-                ->post($this->apiUrl . '/shipment', $payload);
+                ->post($this->apiUrl.'/shipment', $payload);
 
             $body = $response->json();
 
@@ -433,7 +461,7 @@ class BrtService
             $labels = $createResponse['labels']['label'] ?? $body['labels'] ?? [];
             $labelBase64 = '';
             $parcelId = '';
-            if (!empty($labels) && is_array($labels)) {
+            if (! empty($labels) && is_array($labels)) {
                 $first = $labels[0] ?? null;
                 if ($first) {
                     $parcelId = $first['parcelID'] ?? $first['parcelId'] ?? '';
@@ -445,12 +473,13 @@ class BrtService
                 'success' => true,
                 'parcel_id' => $parcelId,
                 'label_base64' => $labelBase64,
-                'tracking_url' => $parcelId ? 'https://www.brt.it/it/tracking?parcelId=' . urlencode($parcelId) : '',
+                'tracking_url' => $parcelId ? 'https://www.brt.it/it/tracking?parcelId='.urlencode($parcelId) : '',
                 'raw_response' => $body,
             ];
         } catch (\Exception $e) {
             Log::error('BRT TEST createShipment exception', ['error' => $e->getMessage()]);
-            return ['success' => false, 'error' => 'Errore connessione BRT: ' . $e->getMessage()];
+
+            return ['success' => false, 'error' => 'Errore connessione BRT: '.$e->getMessage()];
         }
     }
 
@@ -475,7 +504,7 @@ class BrtService
             $response = Http::withOptions(['verify' => $this->verifySsl])
                 ->timeout(30)
                 ->withHeaders(['Content-Type' => 'application/json'])
-                ->put($this->apiUrl . '/shipment', $payload);
+                ->put($this->apiUrl.'/shipment', $payload);
 
             $body = $response->json();
 
@@ -492,6 +521,7 @@ class BrtService
             return ['success' => true, 'raw_response' => $body];
         } catch (\Exception $e) {
             Log::error('BRT confirmShipment exception', ['error' => $e->getMessage()]);
+
             return ['success' => false, 'error' => $e->getMessage()];
         }
     }
@@ -517,7 +547,7 @@ class BrtService
             $response = Http::withOptions(['verify' => $this->verifySsl])
                 ->timeout(30)
                 ->withHeaders(['Content-Type' => 'application/json'])
-                ->put($this->apiUrl . '/delete', $payload);
+                ->put($this->apiUrl.'/delete', $payload);
 
             $body = $response->json();
             $execCode = $body['executionMessage']['code'] ?? -1;
@@ -534,300 +564,121 @@ class BrtService
 
     /**
      * Cerca punti PUDO (Pick Up Drop Off) per indirizzo.
-     * I PUDO sono negozi convenzionati (tabaccai, edicole, ecc.) dove si possono
-     * ritirare o consegnare i pacchi. Comodo per chi non e' a casa durante la consegna.
-     *
-     * Cerca in un raggio esteso (fino a 50 km) con strategia multi-pass dall'indirizzo specificato.
-     * FALLBACK: Se l'API BRT fallisce, usa il database locale con punti PUDO mock.
+     * Delega a PudoService per la logica di ricerca multi-pass con fallback.
      */
     public function getPudoByAddress(string $address, string $zipCode, string $city, string $countryCode = 'ITA', int $maxResults = 50): array
     {
-        $address = trim($address);
-        $zipCode = preg_replace('/\D/', '', (string) $zipCode);
-        $city = trim($city);
-        $maxResults = max(1, min($maxResults, 50));
-        $coverageKm = 80;
-
-        $strategyUsed = [];
-        $combinedPoints = [];
-        $fallbackUsed = false;
-        $geocodedSeed = null;
-
-        $mergePoints = function (array $points) use (&$combinedPoints, $maxResults): void {
-            if (empty($points)) return;
-            $combinedPoints = $this->mergePudoPoints($combinedPoints, $points, $maxResults);
-        };
-
-        // Pass 1: citta + CAP (se disponibili entrambi)
-        if ($city !== '' && $zipCode !== '') {
-            $strategyUsed[] = 'city_zip';
-            $primaryResult = $this->queryPudoByAddressNoFallback($address, $zipCode, $city, $countryCode, $maxResults);
-            if (!empty($primaryResult['pudo'])) {
-                $mergePoints($primaryResult['pudo']);
-            }
-        }
-
-        // Pass 2: citta con CAP alternativi trovati nella tabella localita'
-        if (count($combinedPoints) < $maxResults && $city !== '') {
-            $alternativeZips = $this->resolveAlternativeZipsForCity($city, $zipCode);
-            if (!empty($alternativeZips)) {
-                $strategyUsed[] = 'city_alt_zip';
-                foreach ($alternativeZips as $alternativeZip) {
-                    if (count($combinedPoints) >= $maxResults) break;
-                    $altResult = $this->queryPudoByAddressNoFallback($address, $alternativeZip, $city, $countryCode, $maxResults);
-                    if (!empty($altResult['pudo'])) {
-                        $mergePoints($altResult['pudo']);
-                    }
-                }
-            }
-        }
-
-        // Pass 2b: solo citta (se ancora incompleto)
-        if (count($combinedPoints) < $maxResults && $city !== '') {
-            $strategyUsed[] = 'city_only';
-            $cityOnlyResult = $this->queryPudoByAddressNoFallback($address, '', $city, $countryCode, $maxResults);
-            if (!empty($cityOnlyResult['pudo'])) {
-                $mergePoints($cityOnlyResult['pudo']);
-            }
-        }
-
-        // Pass 3: solo CAP (utile se la citta non produce match)
-        if (count($combinedPoints) < $maxResults && $zipCode !== '') {
-            $strategyUsed[] = 'zip_only';
-            $zipOnlyResult = $this->queryPudoByAddressNoFallback($address, $zipCode, '', $countryCode, $maxResults);
-            if (!empty($zipOnlyResult['pudo'])) {
-                $mergePoints($zipOnlyResult['pudo']);
-            }
-        }
-
-        // Pass 4: nearby da coordinate geocodificate dell'input testuale
-        if (count($combinedPoints) < $maxResults) {
-            $geocodedSeed = $this->geocodeInputToCoordinates($address, $city, $zipCode);
-            if ($geocodedSeed) {
-                $strategyUsed[] = 'nearby_geo_input';
-                $nearbyResult = $this->getPudoByCoordinates(
-                    (float) $geocodedSeed['latitude'],
-                    (float) $geocodedSeed['longitude'],
-                    $maxResults
-                );
-                if (!empty($nearbyResult['pudo'])) {
-                    $mergePoints($nearbyResult['pudo']);
-                    if (!empty($nearbyResult['fallback'])) {
-                        $fallbackUsed = true;
-                    }
-                }
-            }
-        }
-
-        // Pass 5: griglia geografica attorno al seed per aumentare la copertura in citta piccole.
-        if (
-            count($combinedPoints) < min($maxResults, 30) &&
-            is_array($geocodedSeed) &&
-            isset($geocodedSeed['latitude'], $geocodedSeed['longitude'])
-        ) {
-            $strategyUsed[] = 'nearby_geo_grid';
-            $gridPoints = $this->buildGeoGridSearchPoints((float) $geocodedSeed['latitude'], (float) $geocodedSeed['longitude']);
-            $gridBatchResults = min($maxResults, 30);
-
-            foreach ($gridPoints as $gridPoint) {
-                if (count($combinedPoints) >= $maxResults) {
-                    break;
-                }
-
-                $gridNearbyResult = $this->getPudoByCoordinates(
-                    (float) $gridPoint['latitude'],
-                    (float) $gridPoint['longitude'],
-                    $gridBatchResults
-                );
-
-                if (!empty($gridNearbyResult['pudo'])) {
-                    $mergePoints($gridNearbyResult['pudo']);
-                    if (!empty($gridNearbyResult['fallback'])) {
-                        $fallbackUsed = true;
-                    }
-                }
-            }
-        }
-
-        // Fallback finale database locale
-        if (empty($combinedPoints)) {
-            $fallbackResult = $this->getPudoFromDatabase($city, $zipCode, $maxResults);
-            if (!empty($fallbackResult['pudo'])) {
-                $mergePoints($fallbackResult['pudo']);
-                $fallbackUsed = true;
-                $strategyUsed[] = 'fallback_db';
-            }
-        }
-
-        $combinedPoints = array_values(array_filter($combinedPoints, function ($point) {
-            $provider = strtoupper(trim((string) ($point['provider'] ?? 'BRT')));
-            return $provider === '' || $provider === 'BRT';
-        }));
-        $combinedPoints = array_map(function ($point) {
-            $point['provider'] = 'BRT';
-            return $point;
-        }, $combinedPoints);
-
-        $combinedPoints = $this->sortPudoByDistance($combinedPoints);
-        if (count($combinedPoints) > $maxResults) {
-            $combinedPoints = array_slice($combinedPoints, 0, $maxResults);
-        }
-
-        if (empty($combinedPoints)) {
-            return [
-                'success' => false,
-                'error' => 'Nessun punto PUDO trovato per i dati inseriti.',
-                'pudo' => [],
-                'fallback' => $fallbackUsed,
-                'meta' => [
-                    'strategy_used' => array_values(array_unique($strategyUsed)),
-                    'search_passes' => count(array_unique($strategyUsed)),
-                    'coverage_km' => $coverageKm,
-                    'returned_count' => 0,
-                    'requested_count' => $maxResults,
-                    'fallback' => $fallbackUsed,
-                    'provider' => 'BRT',
-                ],
-            ];
-        }
-
-        return [
-            'success' => true,
-            'pudo' => $combinedPoints,
-            'fallback' => $fallbackUsed,
-            'meta' => [
-                'strategy_used' => array_values(array_unique($strategyUsed)),
-                'search_passes' => count(array_unique($strategyUsed)),
-                'coverage_km' => $coverageKm,
-                'returned_count' => count($combinedPoints),
-                'requested_count' => $maxResults,
-                'fallback' => $fallbackUsed,
-                'provider' => 'BRT',
-            ],
-        ];
+        return $this->pudoService->getPudoByAddress($address, $zipCode, $city, $countryCode, $maxResults);
     }
 
     /**
      * Cerca punti PUDO per coordinate GPS (latitudine e longitudine).
-     * Utile quando l'utente condivide la propria posizione dal telefono.
-     * FALLBACK: Se l'API BRT fallisce, usa il database locale con punti PUDO mock.
+     * Delega a PudoService per la logica di ricerca con fallback database.
      */
     public function getPudoByCoordinates(float $latitude, float $longitude, int $maxResults = 50): array
     {
-        $maxResults = max(1, min($maxResults, 50));
-
-        try {
-            // withoutVerifying(): certificato self-signed BRT (vedi searchPudo)
-            $response = Http::timeout(15)
-                ->withoutVerifying()
-                ->withHeaders([
-                    'X-API-Auth' => $this->pudoToken,
-                    'Accept' => 'application/json',
-                ])
-                ->get($this->pudoApiUrl . '/pudo/v1/open/pickup/get-pudo-by-lat-lng', [
-                    'latitude' => $latitude,
-                    'longitude' => $longitude,
-                    'max_pudo_number' => $maxResults,
-                    'maxDistanceSearch' => 50000,        // Raggio di ricerca in metri (max 50000)
-                ]);
-
-            $body = $response->json();
-
-            if (!$response->successful()) {
-                Log::warning('BRT PUDO coordinates API error - using fallback', [
-                    'status' => $response->status(),
-                    'lat' => $latitude,
-                    'lng' => $longitude,
-                ]);
-                // FALLBACK: usa database locale
-                return $this->getPudoFromDatabaseByCoordinates($latitude, $longitude, $maxResults);
-            }
-
-            $pudoList = $body['pudo'] ?? [];
-
-            // Se l'API non restituisce risultati, prova il fallback
-            if (empty($pudoList)) {
-                Log::info('BRT PUDO coordinates API returned no results - using fallback', ['lat' => $latitude, 'lng' => $longitude]);
-                return $this->getPudoFromDatabaseByCoordinates($latitude, $longitude, $maxResults);
-            }
-
-            return [
-                'success' => true,
-                'pudo' => array_map(fn($p) => [
-                    'pudo_id' => $p['pudoId'] ?? '',
-                    'carrier_pudo_id' => $p['carrierPudoId'] ?? '',
-                    'name' => $p['pointName'] ?? '',
-                    'address' => $p['fullAddress'] ?? (($p['street'] ?? '') . ' ' . ($p['streetNumber'] ?? '')),
-                    'city' => $p['town'] ?? '',
-                    'zip_code' => $p['zipCode'] ?? '',
-                    'province' => $p['state'] ?? '',
-                    'country' => $p['country'] ?? 'ITA',
-                    'latitude' => $p['latitude'] ?? null,
-                    'longitude' => $p['longitude'] ?? null,
-                    'distance_meters' => $p['distanceFromPoint'] ?? null,
-                    'enabled' => $p['enabled'] ?? true,
-                    'opening_hours' => $p['hours'] ?? [],
-                    'localization_hint' => $p['localizationHint'] ?? '',
-                    'provider' => 'BRT',
-                ], $pudoList),
-                'fallback' => false,
-                'meta' => [
-                    'strategy_used' => ['nearby_geo'],
-                    'returned_count' => count($pudoList),
-                    'requested_count' => $maxResults,
-                    'fallback' => false,
-                    'provider' => 'BRT',
-                ],
-            ];
-        } catch (\Exception $e) {
-            Log::error('BRT PUDO coordinates exception - using fallback', ['error' => $e->getMessage(), 'lat' => $latitude, 'lng' => $longitude]);
-            // FALLBACK: usa database locale
-            return $this->getPudoFromDatabaseByCoordinates($latitude, $longitude, $maxResults);
-        }
+        return $this->pudoService->getPudoByCoordinates($latitude, $longitude, $maxResults);
     }
 
     /**
      * Mostra i dettagli di un punto PUDO specifico (orari completi, servizi disponibili, ecc.).
+     * Delega a PudoService.
      */
     public function getPudoDetails(string $pudoId): array
     {
-        try {
-            // withoutVerifying(): certificato self-signed BRT (vedi searchPudo)
-            $response = Http::timeout(15)
-                ->withoutVerifying()
-                ->withHeaders([
-                    'X-API-Auth' => $this->pudoToken,
-                    'Accept' => 'application/json',
-                ])
-                ->get($this->pudoApiUrl . '/pudo/v1/open/pickup/get-pudo-details', [
-                    'pudoId' => $pudoId,
-                ]);
-
-            $body = $response->json();
-
-            if (!$response->successful()) {
-                return ['success' => false, 'error' => 'Errore PUDO details API'];
-            }
-
-            return ['success' => true, 'pudo' => $body];
-        } catch (\Exception $e) {
-            return ['success' => false, 'error' => $e->getMessage()];
-        }
+        return $this->pudoService->getPudoDetails($pudoId);
     }
 
     /**
      * Genera l'URL per seguire il tracking di un pacco BRT.
-     * Usa il sistema VAS di BRT che accetta il numero di collo come riferimento.
-     * Il tracking permette di vedere dove si trova il pacco in tempo reale.
+     * Delega a TrackingService.
      *
-     * @param string $parcelNumber  Il numero di collo BRT (parcelNumberFrom) o parcelId
+     * @param  string  $parcelNumber  Il numero di collo BRT (parcelNumberFrom) o parcelId
      */
     public function getTrackingUrl(string $parcelNumber): string
     {
-        if (empty($parcelNumber)) {
-            return '';
+        return $this->trackingService->getTrackingUrl($parcelNumber);
+    }
+
+    /**
+     * Restituisce lo stato di tracking di un ordine BRT.
+     * Delega a TrackingService.
+     */
+    public function getTrackingStatus(Order $order): array
+    {
+        return $this->trackingService->getTrackingStatus($order);
+    }
+
+    public function requestHomePickup(Order $order, array $pickupRequest): array
+    {
+        if (! ((bool) ($pickupRequest['enabled'] ?? false))) {
+            return ['success' => true, 'status' => 'not_requested'];
         }
-        return 'https://vas.brt.it/vas/sped_det_show.hsm?refnr=' . urlencode($parcelNumber) . '&tiession=';
+
+        if (empty($order->brt_parcel_id)) {
+            return [
+                'success' => false,
+                'status' => 'failed',
+                'error' => 'Impossibile richiedere il ritiro senza etichetta BRT generata.',
+            ];
+        }
+
+        return [
+            'success' => false,
+            'status' => 'failed',
+            'error' => 'Integrazione ritiro BRT non disponibile in questa installazione.',
+        ];
+    }
+
+    public function createBordero(Order $order): array
+    {
+        $order->loadMissing(['packages.originAddress', 'packages.destinationAddress', 'packages.service', 'user']);
+
+        /** @var Package|null $package */
+        $package = $order->packages->first();
+        if (! $package || ! $package->originAddress || ! $package->destinationAddress) {
+            return [
+                'success' => false,
+                'error' => 'Dati spedizione insufficienti per generare il borderò.',
+            ];
+        }
+
+        $origin = $package->originAddress;
+        $destination = $package->destinationAddress;
+        $parcelCount = (int) $order->packages->sum(fn (Package $item) => max(1, (int) ($item->quantity ?? 1)));
+        $reference = 'BORD-'.str_pad((string) $order->id, 8, '0', STR_PAD_LEFT);
+        $pdf = app(BorderoPdfBuilder::class)->build([
+            'bordero_date' => now()->format('d/m/Y'),
+            'bordero_number' => (string) $order->id,
+            'bordero_reference' => $reference,
+            'localita' => (string) ($destination->city ?? ''),
+            'prov' => (string) ($destination->province ?? ''),
+            'lna' => (string) ($destination->postal_code ?? ''),
+            'rif_num' => (string) $order->id,
+            'rif_alpha' => (string) ($order->brt_parcel_id ?? $order->id),
+            'cod_bolla' => (string) ($order->brt_parcel_id ?? 'n/d'),
+            'incasso' => $order->is_cod ? 'COD' : 'NO',
+            'importo_incasso' => $order->is_cod ? number_format(((int) $order->cod_amount) / 100, 2, ',', '.') : '0,00',
+            'importo_assicurare' => '0,00',
+            'colli' => (string) $parcelCount,
+            'sender_name' => (string) ($origin->name ?? ''),
+            'sender_address' => trim((string) (($origin->address ?? '').' '.($origin->address_number ?? ''))),
+            'sender_city_line' => trim((string) (($origin->postal_code ?? '').' '.($origin->city ?? '').' ('.($origin->province ?? '').')')),
+            'sender_phone' => (string) ($origin->telephone_number ?? ''),
+            'recipient_name' => (string) ($destination->name ?? ''),
+            'recipient_address' => trim((string) (($destination->address ?? '').' '.($destination->address_number ?? ''))),
+            'recipient_city_line' => trim((string) (($destination->postal_code ?? '').' '.($destination->city ?? '').' ('.($destination->province ?? '').')')),
+            'recipient_phone' => (string) ($destination->telephone_number ?? ''),
+            'created_at' => now()->format('d/m/Y H:i'),
+        ]);
+
+        return [
+            'success' => true,
+            'bordero_reference' => $reference,
+            'document_base64' => base64_encode($pdf),
+            'document_mime' => 'application/pdf',
+            'document_filename' => 'bordero-'.$order->id.'.pdf',
+        ];
     }
 
     /**
@@ -851,29 +702,31 @@ class BrtService
      *   - Non sovrascrivere campi gia' impostati (controllato con isset)
      *   - Non rimuovere il log dei servizi non mappati (utile per trovare servizi mancanti)
      *
-     * @param array &$payload  Il payload da inviare a BRT (modificato per riferimento)
-     * @param Order $order     L'ordine con i pacchi e servizi caricati
-     * @param array $options   Opzioni aggiuntive passate dal chiamante
+     * @param  array  &$payload  Il payload da inviare a BRT (modificato per riferimento)
+     * @param  Order  $order  L'ordine con i pacchi e servizi caricati
+     * @param  array  $options  Opzioni aggiuntive passate dal chiamante
      */
     private function addServicesToPayload(array &$payload, Order $order, array $options): void
     {
         // Mappa dei nomi di servizio dell'applicazione -> parametri API BRT
         // I nomi sono normalizzati in minuscolo per la comparazione
         $serviceMapping = [
-            'consegna al piano'     => ['field' => 'particularitiesDeliveryManagement', 'value' => 'CP'],
-            'delivery al piano'     => ['field' => 'particularitiesDeliveryManagement', 'value' => 'CP'],
-            'ritiro al piano'       => ['field' => 'particularitiesPickupManagement', 'value' => 'RP'],
-            'pickup al piano'       => ['field' => 'particularitiesPickupManagement', 'value' => 'RP'],
-            'express'               => ['field' => 'serviceType', 'value' => 'E'],
-            'priority'              => ['field' => 'serviceType', 'value' => 'P'],
-            '10:30'                 => ['field' => 'serviceType', 'value' => 'O'],
-            'economy'               => ['field' => 'serviceType', 'value' => 'N'],
+            'consegna al piano' => ['field' => 'particularitiesDeliveryManagement', 'value' => 'CP'],
+            'delivery al piano' => ['field' => 'particularitiesDeliveryManagement', 'value' => 'CP'],
+            'ritiro al piano' => ['field' => 'particularitiesPickupManagement', 'value' => 'RP'],
+            'pickup al piano' => ['field' => 'particularitiesPickupManagement', 'value' => 'RP'],
+            'express' => ['field' => 'serviceType', 'value' => 'E'],
+            'priority' => ['field' => 'serviceType', 'value' => 'P'],
+            '10:30' => ['field' => 'serviceType', 'value' => 'O'],
+            'economy' => ['field' => 'serviceType', 'value' => 'N'],
+            'sponda idraulica' => ['field' => 'particularitiesDeliveryManagement', 'value' => 'SU'],
+            'tail lift' => ['field' => 'particularitiesDeliveryManagement', 'value' => 'SU'],
         ];
 
         // Raccogliamo tutti i tipi di servizio dai pacchi dell'ordine
         $appliedServices = [];
         foreach ($order->packages as $package) {
-            if ($package->service && !empty($package->service->service_type)) {
+            if ($package->service && ! empty($package->service->service_type)) {
                 $serviceType = mb_strtolower(trim($package->service->service_type), 'UTF-8');
 
                 if (isset($serviceMapping[$serviceType])) {
@@ -882,7 +735,7 @@ class BrtService
                     $value = $mapping['value'];
 
                     // Evitiamo di sovrascrivere campi gia' impostati
-                    if (!isset($payload['createData'][$field])) {
+                    if (! isset($payload['createData'][$field])) {
                         $payload['createData'][$field] = $value;
                         $appliedServices[] = [
                             'app_service' => $package->service->service_type,
@@ -903,7 +756,7 @@ class BrtService
         }
 
         // Servizi aggiuntivi passati nelle opzioni (dal chiamante)
-        if (!empty($options['insurance_amount'])) {
+        if (! empty($options['insurance_amount'])) {
             $payload['createData']['insuranceAmount'] = (float) ($options['insurance_amount'] / 100); // Da centesimi a euro
             $appliedServices[] = [
                 'app_service' => 'assicurazione',
@@ -912,7 +765,17 @@ class BrtService
             ];
         }
 
-        if (!empty($options['delivery_appointment'])) {
+        // Senza etichetta: il mittente non stampa l'etichetta, BRT la genera al ritiro
+        if (! empty($options['no_label'])) {
+            $payload['isLabelRequired'] = 0;
+            $appliedServices[] = [
+                'app_service' => 'senza_etichetta',
+                'brt_field' => 'isLabelRequired',
+                'brt_value' => 0,
+            ];
+        }
+
+        if (! empty($options['delivery_appointment'])) {
             $payload['createData']['isAlertRequired'] = '1';
             $payload['createData']['particularitiesDeliveryManagement'] =
                 $payload['createData']['particularitiesDeliveryManagement'] ?? 'AP'; // AP = Appuntamento
@@ -924,7 +787,7 @@ class BrtService
         }
 
         // Logghiamo i servizi applicati per debug e monitoraggio
-        if (!empty($appliedServices)) {
+        if (! empty($appliedServices)) {
             Log::info('BRT services applied to shipment', [
                 'order_id' => $order->id,
                 'services' => $appliedServices,
@@ -953,224 +816,27 @@ class BrtService
      *   - Non rimuovere lo step 4 (risoluzione da DB): risolve molti casi ambigui
      *   - Non rendere lo step 4 obbligatorio: se la tabella locations non esiste, deve continuare
      *
-     * @param object $address  L'oggetto indirizzo (PackageAddress) con city, postal_code, province
-     * @return array  Array con chiavi: city, postal_code, province (normalizzati per BRT)
+     * @param  object  $address  L'oggetto indirizzo (PackageAddress) con city, postal_code, province
+     * @return array Array con chiavi: city, postal_code, province (normalizzati per BRT)
      */
     private function normalizeAddressForBrt(object $address): array
     {
-        $city = trim($address->city ?? '');
-        $postalCode = trim($address->postal_code ?? '');
-        $province = trim($address->province ?? '');
-
-        // 1. Normalizza il CAP: solo cifre, zero-padded a 5 caratteri
-        $postalCode = preg_replace('/[^0-9]/', '', $postalCode);
-        $postalCode = str_pad($postalCode, 5, '0', STR_PAD_LEFT);
-
-        // 2. Normalizza la provincia (sigla a 2 lettere)
-        $province = $this->provinceToAbbreviation($province);
-
-        // 3. Normalizza la citta': maiuscolo e abbreviazioni espanse
-        $city = $this->normalizeCityName($city);
-
-        // 4. Prova a trovare la citta' corretta dal database locations usando il CAP
-        //    Questo risolve i casi in cui l'utente ha scritto il nome della citta'
-        //    in modo diverso da quello che BRT si aspetta (es. "S. Giovanni" vs "SAN GIOVANNI")
-        //    Nota: se la tabella locations non esiste, saltiamo questo step senza errori
-        try {
-            if (\Illuminate\Support\Facades\Schema::hasTable('locations')) {
-                $city = $this->resolveCityFromLocations($city, $postalCode, $province);
-            }
-        } catch (\Exception $e) {
-            // Se la tabella non esiste o c'e' un errore DB, continuiamo con la citta' normalizzata
-            Log::debug('BRT normalizeAddress: locations table not available', ['error' => $e->getMessage()]);
-        }
-
-        return [
-            'city' => $city,
-            'postal_code' => $postalCode,
-            'province' => $province,
-        ];
+        return $this->addressNormalizer->normalize($address);
     }
 
-    /**
-     * Normalizza il nome della citta' per BRT:
-     * - Converte in maiuscolo
-     * - Espande le abbreviazioni comuni italiane
-     * - Rimuove spazi multipli e caratteri non necessari
-     */
     private function normalizeCityName(string $city): string
     {
-        // Converti in maiuscolo
-        $city = mb_strtoupper(trim($city), 'UTF-8');
-
-        // Espandi abbreviazioni comuni italiane usate nei nomi di citta'
-        // L'ordine e' importante: prima le piu' specifiche, poi le piu' generiche
-        $abbreviations = [
-            '/\bSS\.\s*/u' => 'SANTISSIMO ',
-            '/\bS\.S\.\s*/u' => 'SANTISSIMO ',
-            '/\bS\.\s*/u' => 'SAN ',
-            '/\bSTA\.\s*/u' => 'SANTA ',
-            '/\bSTO\.\s*/u' => 'SANTO ',
-            '/\bV\.LE\s*/u' => 'VIALE ',
-            '/\bP\.ZZA\s*/u' => 'PIAZZA ',
-            '/\bC\.SO\s*/u' => 'CORSO ',
-            '/\bF\.LLI\s*/u' => 'FRATELLI ',
-            '/\bMTE\.\s*/u' => 'MONTE ',
-        ];
-
-        foreach ($abbreviations as $pattern => $replacement) {
-            $city = preg_replace($pattern, $replacement, $city);
-        }
-
-        // Rimuovi spazi multipli
-        $city = preg_replace('/\s+/', ' ', trim($city));
-
-        return $city;
+        return $this->addressNormalizer->normalizeCityName($city);
     }
 
-    /**
-     * resolveCityFromLocations — Risolve il nome citta' corretto dal database locations.
-     *
-     * PERCHE': L'utente potrebbe scrivere "S. Giovanni" ma BRT vuole "SAN GIOVANNI LUPATOTO".
-     *   Il database locations contiene i nomi ufficiali del sistema postale italiano,
-     *   che corrispondono a quelli usati dal routing BRT.
-     *
-     * COME LEGGERLO:
-     *   1. Match esatto: CAP + nome citta' (conferma dati corretti)
-     *   2. Un solo risultato per CAP: usa quello (caso piu' comune)
-     *   3. Match parziale: una citta' contiene l'altra (es. "REGGIO" in "REGGIO EMILIA")
-     *   4. Match per provincia: se ci sono piu' citta' con lo stesso CAP, preferisce quella con provincia giusta
-     *   5. Nessun match: restituisce la citta' originale (fallback sicuro)
-     *
-     * COME MODIFICARLO:
-     *   - Per aggiungere un criterio di matching: aggiungere un blocco prima del return finale
-     *   - La strategia e' in ordine di priorita', i primi match vincono
-     *
-     * COSA EVITARE:
-     *   - Non lanciare eccezioni: se il DB non funziona, restituire la citta' originale
-     *   - Non cambiare l'ordine degli step senza testare (il match esatto deve restare primo)
-     */
     private function resolveCityFromLocations(string $normalizedCity, string $postalCode, string $province): string
     {
-        if (empty($postalCode) || $postalCode === '00000') {
-            return $normalizedCity;
-        }
-
-        try {
-            // 1. Corrispondenza esatta: CAP + nome citta' (case-insensitive)
-            $exactMatch = \App\Models\Location::where('postal_code', $postalCode)
-                ->whereRaw('UPPER(place_name) = ?', [$normalizedCity])
-                ->first();
-
-            if ($exactMatch) {
-                // I dati sono corretti, restituisci il nome dal database in maiuscolo
-                return mb_strtoupper($exactMatch->place_name, 'UTF-8');
-            }
-
-            // 2. Cerca tutte le citta' con questo CAP
-            $citiesByZip = \App\Models\Location::where('postal_code', $postalCode)->get();
-
-            if ($citiesByZip->isEmpty()) {
-                // CAP non trovato nel database, restituisci la citta' com'e'
-                Log::warning('BRT address normalization: ZIP code not found in locations database', [
-                    'postal_code' => $postalCode,
-                    'city' => $normalizedCity,
-                ]);
-                return $normalizedCity;
-            }
-
-            // Se c'e' un solo risultato per questo CAP, usa quello
-            if ($citiesByZip->count() === 1) {
-                $resolved = mb_strtoupper($citiesByZip->first()->place_name, 'UTF-8');
-                if ($resolved !== $normalizedCity) {
-                    Log::info('BRT address normalization: resolved city from ZIP', [
-                        'original_city' => $normalizedCity,
-                        'resolved_city' => $resolved,
-                        'postal_code' => $postalCode,
-                    ]);
-                }
-                return $resolved;
-            }
-
-            // 3. Se ci sono piu' citta' con lo stesso CAP, cerca una corrispondenza parziale
-            //    (es. l'utente ha scritto "REGGIO EMILIA" e nel DB c'e' "REGGIO NELL'EMILIA")
-            foreach ($citiesByZip as $location) {
-                $dbCity = mb_strtoupper($location->place_name, 'UTF-8');
-
-                // Controlla se una contiene l'altra
-                if (str_contains($dbCity, $normalizedCity) || str_contains($normalizedCity, $dbCity)) {
-                    Log::info('BRT address normalization: partial match found', [
-                        'original_city' => $normalizedCity,
-                        'resolved_city' => $dbCity,
-                        'postal_code' => $postalCode,
-                    ]);
-                    return $dbCity;
-                }
-            }
-
-            // 4. Se c'e' una corrispondenza di provincia, preferisci quella
-            if (!empty($province)) {
-                $provinceMatch = $citiesByZip->first(function ($loc) use ($province) {
-                    return mb_strtoupper($loc->province ?? '', 'UTF-8') === $province;
-                });
-                if ($provinceMatch) {
-                    $resolved = mb_strtoupper($provinceMatch->place_name, 'UTF-8');
-                    Log::info('BRT address normalization: resolved city from ZIP + province', [
-                        'original_city' => $normalizedCity,
-                        'resolved_city' => $resolved,
-                        'postal_code' => $postalCode,
-                        'province' => $province,
-                    ]);
-                    return $resolved;
-                }
-            }
-
-            // 5. Nessuna corrispondenza trovata, restituisci la citta' originale
-            Log::warning('BRT address normalization: no matching city found for ZIP', [
-                'postal_code' => $postalCode,
-                'city' => $normalizedCity,
-                'available_cities' => $citiesByZip->pluck('place_name')->toArray(),
-            ]);
-            return $normalizedCity;
-
-        } catch (\Exception $e) {
-            // In caso di errore DB, non bloccare la spedizione
-            Log::warning('BRT address normalization exception', [
-                'error' => $e->getMessage(),
-                'city' => $normalizedCity,
-                'postal_code' => $postalCode,
-            ]);
-            return $normalizedCity;
-        }
+        return $this->addressNormalizer->resolveCityFromLocations($normalizedCity, $postalCode, $province);
     }
 
-    /**
-     * Traduce gli errori BRT in messaggi leggibili in italiano.
-     * Fornisce suggerimenti su come risolvere il problema.
-     */
     private function translateBrtError(int $code, string $codeDesc, string $message, array $createData): string
     {
-        $city = $createData['consigneeCity'] ?? '?';
-        $zip = $createData['consigneeZIPCode'] ?? '?';
-        $province = $createData['consigneeProvinceAbbreviation'] ?? '?';
-
-        // Errori di routing (indirizzo non trovato)
-        if ($code === -63 || stripos($codeDesc, 'ROUTING') !== false) {
-            return "Errore indirizzo BRT: la citta' '{$city}' non corrisponde al CAP '{$zip}' (provincia: {$province}). "
-                . "Verificare che citta', CAP e provincia siano corretti e corrispondano tra loro.";
-        }
-
-        // Errori di autenticazione
-        if ($code === -1 && (stripos($message, 'auth') !== false || stripos($message, 'password') !== false || stripos($message, 'user') !== false)) {
-            return "Errore autenticazione BRT: credenziali non valide. Verificare BRT_CLIENT_ID e BRT_PASSWORD nel file .env.";
-        }
-
-        // Errore generico con messaggio BRT
-        if ($message) {
-            return "Errore BRT (code: {$code}, {$codeDesc}): {$message}";
-        }
-
-        return "Errore BRT sconosciuto (code: {$code}).";
+        return $this->errorTranslator->translate($code, $codeDesc, $message, $createData);
     }
 
     /**
@@ -1180,11 +846,11 @@ class BrtService
     private function buildNotes(Order $order, array $options): string
     {
         // Se l'utente ha specificato note personalizzate, le usiamo
-        if (!empty($options['notes'])) {
+        if (! empty($options['notes'])) {
             return $options['notes'];
         }
 
-        $notes = 'SpediamoFacile ordine #' . $order->id;
+        $notes = 'SpediamoFacile ordine #'.$order->id;
 
         // Aggiungiamo la descrizione del contenuto dai pacchi (campo content_description)
         $descriptions = $order->packages
@@ -1194,503 +860,56 @@ class BrtService
             ->implode(', ');
 
         if ($descriptions) {
-            $notes .= ' - Contenuto: ' . $descriptions;
+            $notes .= ' - Contenuto: '.$descriptions;
         }
 
         // BRT ha un limite di 50 caratteri per le note
         return mb_substr($notes, 0, 50);
     }
 
-    /**
-     * Converte il nome della provincia italiana nella sigla a 2 lettere.
-     * BRT richiede la sigla (es. "MI" per Milano, "RM" per Roma).
-     * Se il valore e' gia' una sigla a 2 lettere, viene restituito cosi' com'e'.
-     * Se il nome non viene trovato, restituisce il valore originale (potrebbe essere gia' una sigla).
-     */
     private function provinceToAbbreviation(string $province): string
     {
-        $province = trim($province);
-
-        // Se e' gia' una sigla a 2 lettere, restituiscila in maiuscolo
-        if (strlen($province) === 2) {
-            return strtoupper($province);
-        }
-
-        // Mappa completa di tutte le 107 province italiane (nome → sigla)
-        $map = [
-            'agrigento' => 'AG', 'alessandria' => 'AL', 'ancona' => 'AN', 'aosta' => 'AO',
-            'arezzo' => 'AR', 'ascoli piceno' => 'AP', 'asti' => 'AT', 'avellino' => 'AV',
-            'bari' => 'BA', 'barletta-andria-trani' => 'BT', 'belluno' => 'BL', 'benevento' => 'BN',
-            'bergamo' => 'BG', 'biella' => 'BI', 'bologna' => 'BO', 'bolzano' => 'BZ',
-            'brescia' => 'BS', 'brindisi' => 'BR', 'cagliari' => 'CA', 'caltanissetta' => 'CL',
-            'campobasso' => 'CB', 'carbonia-iglesias' => 'CI', 'caserta' => 'CE', 'catania' => 'CT',
-            'catanzaro' => 'CZ', 'chieti' => 'CH', 'como' => 'CO', 'cosenza' => 'CS',
-            'cremona' => 'CR', 'crotone' => 'KR', 'cuneo' => 'CN', 'enna' => 'EN',
-            'fermo' => 'FM', 'ferrara' => 'FE', 'firenze' => 'FI', 'foggia' => 'FG',
-            'forlì-cesena' => 'FC', 'forli-cesena' => 'FC', 'frosinone' => 'FR', 'genova' => 'GE',
-            'gorizia' => 'GO', 'grosseto' => 'GR', 'imperia' => 'IM', 'isernia' => 'IS',
-            'la spezia' => 'SP', 'l\'aquila' => 'AQ', 'laquila' => 'AQ', 'latina' => 'LT',
-            'lecce' => 'LE', 'lecco' => 'LC', 'livorno' => 'LI', 'lodi' => 'LO',
-            'lucca' => 'LU', 'macerata' => 'MC', 'mantova' => 'MN', 'massa-carrara' => 'MS',
-            'massa carrara' => 'MS', 'matera' => 'MT', 'medio campidano' => 'VS',
-            'messina' => 'ME', 'milano' => 'MI', 'modena' => 'MO', 'monza e brianza' => 'MB',
-            'monza' => 'MB', 'napoli' => 'NA', 'novara' => 'NO', 'nuoro' => 'NU',
-            'ogliastra' => 'OG', 'olbia-tempio' => 'OT', 'oristano' => 'OR', 'padova' => 'PD',
-            'palermo' => 'PA', 'parma' => 'PR', 'pavia' => 'PV', 'perugia' => 'PG',
-            'pesaro e urbino' => 'PU', 'pesaro-urbino' => 'PU', 'pescara' => 'PE',
-            'piacenza' => 'PC', 'pisa' => 'PI', 'pistoia' => 'PT', 'pordenone' => 'PN',
-            'potenza' => 'PZ', 'prato' => 'PO', 'ragusa' => 'RG', 'ravenna' => 'RA',
-            'reggio calabria' => 'RC', 'reggio emilia' => 'RE', 'rieti' => 'RI', 'rimini' => 'RN',
-            'roma' => 'RM', 'rovigo' => 'RO', 'salerno' => 'SA', 'sassari' => 'SS',
-            'savona' => 'SV', 'siena' => 'SI', 'siracusa' => 'SR', 'sondrio' => 'SO',
-            'sud sardegna' => 'SU', 'taranto' => 'TA', 'teramo' => 'TE', 'terni' => 'TR',
-            'torino' => 'TO', 'trapani' => 'TP', 'trento' => 'TN', 'treviso' => 'TV',
-            'trieste' => 'TS', 'udine' => 'UD', 'varese' => 'VA', 'venezia' => 'VE',
-            'verbano-cusio-ossola' => 'VB', 'verbania' => 'VB', 'vercelli' => 'VC',
-            'verona' => 'VR', 'vibo valentia' => 'VV', 'vicenza' => 'VI', 'viterbo' => 'VT',
-        ];
-
-        $lower = strtolower(trim($province));
-
-        return $map[$lower] ?? strtoupper($province);
+        return $this->addressNormalizer->provinceToAbbreviation($province);
     }
 
-    /**
-     * Converte il nome del paese (es. "Italia") nel codice ISO 3166-1 Alpha-2 (es. "IT").
-     * BRT richiede il codice a 2 lettere, non il nome completo.
-     */
     private function countryToIso2(string $country): string
     {
-        $map = [
-            'italia' => 'IT',
-            'italy' => 'IT',
-            'francia' => 'FR',
-            'france' => 'FR',
-            'germania' => 'DE',
-            'germany' => 'DE',
-            'deutschland' => 'DE',
-            'spagna' => 'ES',
-            'spain' => 'ES',
-            'regno unito' => 'GB',
-            'united kingdom' => 'GB',
-            'svizzera' => 'CH',
-            'switzerland' => 'CH',
-            'austria' => 'AT',
-            'belgio' => 'BE',
-            'belgium' => 'BE',
-            'olanda' => 'NL',
-            'paesi bassi' => 'NL',
-            'netherlands' => 'NL',
-            'portogallo' => 'PT',
-            'portugal' => 'PT',
-            'polonia' => 'PL',
-            'poland' => 'PL',
-            'grecia' => 'GR',
-            'greece' => 'GR',
-            'irlanda' => 'IE',
-            'ireland' => 'IE',
-            'danimarca' => 'DK',
-            'denmark' => 'DK',
-            'svezia' => 'SE',
-            'sweden' => 'SE',
-            'norvegia' => 'NO',
-            'norway' => 'NO',
-            'finlandia' => 'FI',
-            'finland' => 'FI',
-            'lussemburgo' => 'LU',
-            'luxembourg' => 'LU',
-            'romania' => 'RO',
-            'ungheria' => 'HU',
-            'hungary' => 'HU',
-            'repubblica ceca' => 'CZ',
-            'czech republic' => 'CZ',
-            'slovacchia' => 'SK',
-            'slovakia' => 'SK',
-            'slovenia' => 'SI',
-            'croazia' => 'HR',
-            'croatia' => 'HR',
-            'bulgaria' => 'BG',
-        ];
-
-        $lower = strtolower(trim($country));
-
-        // Se è già un codice ISO a 2 lettere, restituiscilo direttamente
-        if (strlen($country) === 2) {
-            return strtoupper($country);
-        }
-
-        return $map[$lower] ?? 'IT';
+        return $this->addressNormalizer->countryToIso2($country);
     }
 
     /**
-     * Chiamata singola API PUDO senza fallback automatico.
+     * Risolve automaticamente il codice filiale BRT dal CAP del mittente.
+     * Strategia: match esatto → prime 3 cifre → prime 2 cifre → fallback config.
      */
-    private function queryPudoByAddressNoFallback(string $address, string $zipCode, string $city, string $countryCode, int $maxResults): array
+    private function resolveFilialeByCap(string $senderPostalCode): int
     {
-        try {
-            $headers = ['Accept' => 'application/json'];
-            if (!empty($this->pudoToken)) {
-                $headers['X-API-Auth'] = $this->pudoToken;
-            }
+        $cap = str_pad(trim($senderPostalCode), 5, '0', STR_PAD_LEFT);
+        $filiali = config('brt_filiali.filiali', []);
 
-            $response = Http::timeout(15)
-                ->withoutVerifying()
-                ->withHeaders($headers)
-                ->get($this->pudoApiUrl . '/pudo/v1/open/pickup/get-pudo-by-address', [
-                    'address' => $address,
-                    'zipCode' => $zipCode,
-                    'city' => $city,
-                    'countryCode' => $countryCode,
-                    'max_pudo_number' => max(1, min($maxResults, 50)),
-                    'maxDistanceSearch' => 80000,
-                ]);
-
-            if (!$response->successful()) {
-                Log::warning('BRT PUDO API error (no fallback pass)', [
-                    'status' => $response->status(),
-                    'city' => $city,
-                    'zip' => $zipCode,
-                ]);
-                return ['success' => false, 'pudo' => []];
-            }
-
-            $body = $response->json();
-            $pudoList = $body['pudo'] ?? [];
-            if (empty($pudoList)) {
-                return ['success' => true, 'pudo' => []];
-            }
-
-            return [
-                'success' => true,
-                'pudo' => array_map(fn($item) => $this->mapBrtPudoPoint($item), $pudoList),
-            ];
-        } catch (\Exception $e) {
-            Log::warning('BRT PUDO API exception (no fallback pass)', [
-                'error' => $e->getMessage(),
-                'city' => $city,
-                'zip' => $zipCode,
-            ]);
-            return ['success' => false, 'pudo' => []];
-        }
-    }
-
-    /**
-     * Mappa payload PUDO BRT al formato usato dal frontend.
-     */
-    private function mapBrtPudoPoint(array $point): array
-    {
-        return [
-            'pudo_id' => $point['pudoId'] ?? '',
-            'carrier_pudo_id' => $point['carrierPudoId'] ?? '',
-            'name' => $point['pointName'] ?? '',
-            'address' => $point['fullAddress'] ?? trim(($point['street'] ?? '') . ' ' . ($point['streetNumber'] ?? '')),
-            'city' => $point['town'] ?? '',
-            'zip_code' => $point['zipCode'] ?? '',
-            'province' => $point['state'] ?? '',
-            'country' => $point['country'] ?? 'ITA',
-            'latitude' => $point['latitude'] ?? null,
-            'longitude' => $point['longitude'] ?? null,
-            'distance_meters' => isset($point['distanceFromPoint']) ? (int) round((float) $point['distanceFromPoint']) : null,
-            'enabled' => $point['enabled'] ?? true,
-            'opening_hours' => $point['hours'] ?? [],
-            'localization_hint' => $point['localizationHint'] ?? '',
-            'provider' => 'BRT',
-        ];
-    }
-
-    /**
-     * Geocodifica input testuale (via/citta/CAP) in coordinate per pass nearby.
-     */
-    private function geocodeInputToCoordinates(string $address, string $city, string $zipCode): ?array
-    {
-        try {
-            $parts = array_values(array_filter([
-                trim($address),
-                preg_replace('/\D/', '', (string) $zipCode),
-                trim($city),
-                'Italia',
-            ], fn($value) => (string) $value !== ''));
-
-            if (empty($parts)) {
-                return null;
-            }
-
-            $response = Http::timeout(8)
-                ->acceptJson()
-                ->withHeaders([
-                    'User-Agent' => 'SpediamoFacile/1.0 (PUDO geocode)',
-                ])
-                ->get('https://nominatim.openstreetmap.org/search', [
-                    'format' => 'jsonv2',
-                    'limit' => 1,
-                    'q' => implode(', ', $parts),
-                ]);
-
-            if (!$response->successful()) {
-                return null;
-            }
-
-            $payload = $response->json();
-            $first = is_array($payload) ? ($payload[0] ?? null) : null;
-            if (!$first) {
-                return null;
-            }
-
-            if (!isset($first['lat'], $first['lon']) || !is_numeric($first['lat']) || !is_numeric($first['lon'])) {
-                return null;
-            }
-            $lat = (float) $first['lat'];
-            $lng = (float) $first['lon'];
-
-            return [
-                'latitude' => $lat,
-                'longitude' => $lng,
-            ];
-        } catch (\Exception $e) {
-            Log::debug('PUDO geocode input failed', ['error' => $e->getMessage()]);
-            return null;
-        }
-    }
-
-    /**
-     * Estrae CAP alternativi affidabili dalla tabella localita' per una citta.
-     */
-    private function resolveAlternativeZipsForCity(string $city, string $currentZip = ''): array
-    {
-        try {
-            $normalizedCity = mb_strtoupper(trim($city), 'UTF-8');
-            if ($normalizedCity === '') return [];
-
-            $exact = Location::query()
-                ->whereRaw('UPPER(place_name) = ?', [$normalizedCity])
-                ->pluck('postal_code')
-                ->map(fn($zip) => preg_replace('/\D/', '', (string) $zip))
-                ->filter()
-                ->unique()
-                ->values()
-                ->toArray();
-
-            $zips = $exact;
-            if (empty($zips)) {
-                $zips = Location::query()
-                    ->whereRaw('UPPER(place_name) LIKE ?', [$normalizedCity . '%'])
-                    ->limit(100)
-                    ->pluck('postal_code')
-                    ->map(fn($zip) => preg_replace('/\D/', '', (string) $zip))
-                    ->filter()
-                    ->unique()
-                    ->values()
-                    ->toArray();
-            }
-
-            $currentZip = preg_replace('/\D/', '', (string) $currentZip);
-            if ($currentZip !== '') {
-                $zips = array_values(array_filter($zips, fn($zip) => $zip !== $currentZip));
-            }
-
-            return array_slice($zips, 0, 8);
-        } catch (\Exception $e) {
-            Log::warning('PUDO alternative ZIP resolution failed', [
-                'city' => $city,
-                'error' => $e->getMessage(),
-            ]);
-            return [];
-        }
-    }
-
-    /**
-     * Merge + deduplica punti PUDO per id (o fallback chiave composita).
-     */
-    private function mergePudoPoints(array $base, array $incoming, int $maxResults): array
-    {
-        $combined = array_merge($base, $incoming);
-        $deduped = $this->dedupePudoPoints($combined);
-        $sorted = $this->sortPudoByDistance($deduped);
-        return array_slice($sorted, 0, max(1, min($maxResults, 50)));
-    }
-
-    private function dedupePudoPoints(array $points): array
-    {
-        $map = [];
-        foreach ($points as $point) {
-            $key = (string) ($point['pudo_id'] ?? '');
-            if ($key === '') {
-                $lat = isset($point['latitude']) && is_numeric($point['latitude']) ? number_format((float) $point['latitude'], 6, '.', '') : 'na';
-                $lng = isset($point['longitude']) && is_numeric($point['longitude']) ? number_format((float) $point['longitude'], 6, '.', '') : 'na';
-                $key = sprintf(
-                    '%s|%s|%s|%s|%s|%s',
-                    strtolower((string) ($point['name'] ?? '')),
-                    strtolower((string) ($point['address'] ?? '')),
-                    strtolower((string) ($point['zip_code'] ?? '')),
-                    strtolower((string) ($point['city'] ?? '')),
-                    $lat,
-                    $lng
-                );
-            }
-
-            if (!isset($map[$key])) {
-                $map[$key] = $point;
-                continue;
-            }
-
-            $currentDistance = isset($map[$key]['distance_meters']) && is_numeric($map[$key]['distance_meters'])
-                ? (float) $map[$key]['distance_meters']
-                : INF;
-            $nextDistance = isset($point['distance_meters']) && is_numeric($point['distance_meters'])
-                ? (float) $point['distance_meters']
-                : INF;
-
-            if ($nextDistance < $currentDistance) {
-                $map[$key] = $point;
+        // 1. Match esatto sul CAP
+        foreach ($filiali as $filiale) {
+            if ($filiale['cap'] === $cap) {
+                return (int) $filiale['codice'];
             }
         }
 
-        return array_values($map);
-    }
-
-    private function sortPudoByDistance(array $points): array
-    {
-        usort($points, function ($a, $b) {
-            $aDistance = isset($a['distance_meters']) && is_numeric($a['distance_meters']) ? (float) $a['distance_meters'] : INF;
-            $bDistance = isset($b['distance_meters']) && is_numeric($b['distance_meters']) ? (float) $b['distance_meters'] : INF;
-
-            if ($aDistance === $bDistance) {
-                return strcmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? ''));
-            }
-            return $aDistance <=> $bDistance;
-        });
-
-        return $points;
-    }
-
-    private function buildGeoGridSearchPoints(float $latitude, float $longitude): array
-    {
-        $latKmFactor = 110.574;
-        $lngKmFactor = max(111.320 * cos(deg2rad($latitude)), 30.0);
-
-        $distancesKm = [40, 75];
-        $directions = [
-            [1, 0], [-1, 0], [0, 1], [0, -1],
-            [1, 1], [1, -1], [-1, 1], [-1, -1],
-        ];
-
-        $points = [];
-        foreach ($distancesKm as $distanceKm) {
-            foreach ($directions as [$latDirection, $lngDirection]) {
-                // Nel ring esterno manteniamo i diagonali solo per evitare troppe chiamate.
-                if ($distanceKm >= 75 && abs($latDirection) + abs($lngDirection) === 2) {
-                    continue;
-                }
-
-                $latDelta = ($distanceKm / $latKmFactor) * $latDirection;
-                $lngDelta = ($distanceKm / $lngKmFactor) * $lngDirection;
-                $candidateLat = $latitude + $latDelta;
-                $candidateLng = $longitude + $lngDelta;
-                $key = sprintf('%.5f|%.5f', $candidateLat, $candidateLng);
-                $points[$key] = [
-                    'latitude' => $candidateLat,
-                    'longitude' => $candidateLng,
-                ];
+        // 2. Match sulle prime 3 cifre (stesso sottozone postale)
+        $prefix3 = substr($cap, 0, 3);
+        foreach ($filiali as $filiale) {
+            if (substr($filiale['cap'], 0, 3) === $prefix3) {
+                return (int) $filiale['codice'];
             }
         }
 
-        return array_values($points);
-    }
-
-    /**
-     * FALLBACK: Cerca punti PUDO nel database locale quando l'API BRT non funziona.
-     * Usa la tabella pudo_points popolata con dati mock delle città principali.
-     */
-    private function getPudoFromDatabase(string $city, string $zipCode, int $maxResults): array
-    {
-        try {
-            $points = PudoPoint::searchByLocation($city, $zipCode, $maxResults);
-
-            Log::info('PUDO fallback database search', [
-                'city' => $city,
-                'zip' => $zipCode,
-                'results' => count($points),
-            ]);
-
-            return [
-                'success' => true,
-                'pudo' => array_map(fn($p) => [
-                    'pudo_id' => $p['id'],
-                    'carrier_pudo_id' => $p['id'],
-                    'name' => $p['name'],
-                    'address' => $p['address'],
-                    'city' => $p['city'],
-                    'zip_code' => $p['zip_code'],
-                    'province' => $p['province'],
-                    'country' => $p['country'],
-                    'latitude' => $p['latitude'],
-                    'longitude' => $p['longitude'],
-                    'distance_meters' => $p['distance'] ? (int)($p['distance'] * 1000) : null,
-                    'enabled' => true,
-                    'opening_hours' => $p['opening_hours'] ?? [],
-                    'localization_hint' => '',
-                    'provider' => 'BRT',
-                ], $points),
-                'fallback' => true,
-                'meta' => [
-                    'strategy_used' => ['fallback_db'],
-                    'returned_count' => count($points),
-                    'requested_count' => $maxResults,
-                    'fallback' => true,
-                    'provider' => 'BRT',
-                ],
-            ];
-        } catch (\Exception $e) {
-            Log::error('PUDO fallback database error', ['error' => $e->getMessage()]);
-            return ['success' => false, 'error' => 'Nessun punto PUDO disponibile al momento.', 'pudo' => []];
+        // 3. Match sulle prime 2 cifre (stessa provincia)
+        $prefix2 = substr($cap, 0, 2);
+        foreach ($filiali as $filiale) {
+            if (substr($filiale['cap'], 0, 2) === $prefix2) {
+                return (int) $filiale['codice'];
+            }
         }
-    }
 
-    /**
-     * FALLBACK: Cerca punti PUDO nel database locale per coordinate GPS.
-     */
-    private function getPudoFromDatabaseByCoordinates(float $latitude, float $longitude, int $maxResults): array
-    {
-        try {
-            $points = PudoPoint::searchByCoordinates($latitude, $longitude, $maxResults);
-
-            Log::info('PUDO fallback database search by coordinates', [
-                'lat' => $latitude,
-                'lng' => $longitude,
-                'results' => count($points),
-            ]);
-
-            return [
-                'success' => true,
-                'pudo' => array_map(fn($p) => [
-                    'pudo_id' => $p['id'],
-                    'carrier_pudo_id' => $p['id'],
-                    'name' => $p['name'],
-                    'address' => $p['address'],
-                    'city' => $p['city'],
-                    'zip_code' => $p['zip_code'],
-                    'province' => $p['province'],
-                    'country' => $p['country'],
-                    'latitude' => $p['latitude'],
-                    'longitude' => $p['longitude'],
-                    'distance_meters' => $p['distance'] ? (int)($p['distance'] * 1000) : null,
-                    'enabled' => true,
-                    'opening_hours' => $p['opening_hours'] ?? [],
-                    'localization_hint' => '',
-                    'provider' => 'BRT',
-                ], $points),
-                'fallback' => true,
-                'meta' => [
-                    'strategy_used' => ['fallback_db_coordinates'],
-                    'returned_count' => count($points),
-                    'requested_count' => $maxResults,
-                    'fallback' => true,
-                    'provider' => 'BRT',
-                ],
-            ];
-        } catch (\Exception $e) {
-            Log::error('PUDO fallback database error (coordinates)', ['error' => $e->getMessage()]);
-            return ['success' => false, 'error' => 'Nessun punto PUDO disponibile al momento.', 'pudo' => []];
-        }
+        // 4. Fallback al depot configurato in BRT_DEPARTURE_DEPOT
+        return $this->departureDepot;
     }
 }

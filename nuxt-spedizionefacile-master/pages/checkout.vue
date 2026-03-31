@@ -9,7 +9,7 @@
        GET /api/wallet/balance, GET /api/referral/my-discount,
        GET /api/stripe/default-payment-method, GET /api/orders/{id}.
   COMPOSABLE: useCart (dati carrello), useSanctumAuth (utente autenticato), usePriceBands (promo).
-  ROUTE: /checkout (protetta, middleware sanctum:auth).
+  ROUTE: /checkout (protetta, middleware app-auth).
 
   DATI IN INGRESSO: ?order_id=XXX (query param per pagamento ordine esistente).
   DATI IN USCITA: pagamento completato -> svuotamento carrello, navigazione a successo.
@@ -28,693 +28,85 @@
   ✅ Success animation: animazione completamento pagamento
   ✅ Inline SVG: rimossi tutti i componenti Icon
 
-  PUNTI DI MODIFICA SICURI: metodi di pagamento (aggiungere PayPal), layout fatturazione, stili.
+  PUNTI DI MODIFICA SICURI: metodi di pagamento, layout fatturazione, stili.
   COLLEGAMENTI: composables/useCart.js, pages/carrello.vue, pages/account/spedizioni/.
 -->
 <script setup>
-// Ottimizzazione bundle: import dinamico di Stripe (non incluso nel chunk principale)
-// loadStripe viene importato solo quando serve, dentro onMounted()
-
-// Preconnect to Stripe only on this page (not globally, to save connections on other pages)
-// Aggiunto anche api.stripe.com per velocizzare le chiamate API post-caricamento
+// Preconnect to Stripe on this page only
 useHead({ link: [
 	{ rel: 'preconnect', href: 'https://js.stripe.com', crossorigin: '' },
 	{ rel: 'preconnect', href: 'https://api.stripe.com', crossorigin: '' },
 ] });
+useSeoMeta({ title: 'Checkout | SpediamoFacile', ogTitle: 'Checkout | SpediamoFacile' });
 
-// Meta tag SEO
-useSeoMeta({
-	title: 'Checkout | SpediamoFacile',
-	ogTitle: 'Checkout | SpediamoFacile',
-});
+definePageMeta({ middleware: ["app-auth", "shipment-validation"] });
 
-const { user } = useSanctumAuth();
-const { cart, refresh: refreshCart } = useCart();
-const router = useRouter();
-const sanctum = useSanctumClient();
-const config = useRuntimeConfig();
-const stripePublishableKey = ref('');
+const {
+	// page state
+	pageReady, existingOrderId, existingOrder, initCheckoutPage,
+	// stripe
+	stripeLoading, stripeReady, stripeConfigured,
+	cardPaymentsUnavailable, cardPaymentsNotice, initStripe,
+	// promo
+	loadPriceBands, promoSettings,
+	// packages & totals
+	displayPackages, addressGroups, hasMultipleGroups, mergeGroupsCount,
+	getTotal, getNumberTotal, totalPackages, contentDescription,
+	formatPrice, finalTotal, finalTotalFormatted,
+	// billing
+	fatturazioneType, invoiceSubjectType, fatturaData, billingShippingFullAddress,
+	// wallet
+	walletFormatted, walletLoaded, walletSufficient,
+	// coupon
+	couponCode, couponLoading, couponError, couponApplied, couponPanelOpen,
+	validateCoupon, removeCoupon, autoApplyReferral,
+	// payment method
+	paymentMethod, paymentMethodOptions, selectPaymentMethod,
+	// card element
+	cardElementContainer, cardMounted, cardComplete, cardError,
+	shouldShowCardForm, useNewCard, saveCardForFuture, hasSavedCard, defaultPayment,
+	// payment flow
+	termsAccepted, showConfirmModal, confirmPayment, proceedWithPayment,
+	isProcessing, paymentError, paymentSuccess, successOrderId,
+	paymentStep, paymentActionLabel, canPay, payButtonTooltip,
+	// fallback
+	fallbackFlowRoute,
+} = useCheckout();
 
-// Promo settings per badge nel totale
-const { loadPriceBands, promoSettings } = usePriceBands();
-onMounted(() => { loadPriceBands(); });
+pageReady.value = await initCheckoutPage();
 
-// Protegge la pagina: solo utenti autenticati possono accedere
-definePageMeta({
-	middleware: ["sanctum:auth"],
-});
-
-const route = useRoute();
-// Se c'e' un order_id nella URL, stiamo pagando un ordine gia' esistente
-const existingOrderId = computed(() => route.query.order_id || null);
-
-// Dati dell'ordine esistente (caricato dall'API se order_id presente)
-const existingOrder = ref(null);
-
-// Se stiamo pagando un ordine esistente, carica i suoi dati dall'API
-if (existingOrderId.value) {
-	try {
-		const orderData = await sanctum(`/api/orders/${existingOrderId.value}`);
-		existingOrder.value = orderData?.data || orderData;
-	} catch (e) {
-		console.error('Failed to load order:', e);
-		navigateTo("/account/spedizioni");
-	}
-} else {
-	// Altrimenti, forza il refresh dei dati del carrello (niente cache)
-	clearNuxtData("cart");
-	await refreshCart();
-
-	// Se il carrello e' vuoto, reindirizza alla pagina carrello
-	if (!cart.value || cart.value.data?.length === 0) {
-		navigateTo("/carrello");
-	}
-}
-
-// --- CONFIGURAZIONE STRIPE ---
-// Inizializzazione lato client per evitare problemi con il rendering server-side (SSR)
-let stripe = null;
-const stripeReady = ref(false);
-
-// Carica Stripe quando il componente e' montato nel browser
-// Import dinamico: @stripe/stripe-js viene scaricato solo quando serve (non nel bundle iniziale)
-const stripeTimeout = setTimeout(() => {
-	if (!stripeReady.value) {
-		paymentError.value = 'Impossibile caricare Stripe. Ricarica la pagina.';
-	}
-}, 10000); // 10 secondi
-
-const resolveStripePublishableKey = async () => {
-	try {
-		const stripeConfig = await sanctum('/api/settings/stripe');
-		const key = String(stripeConfig?.publishable_key || '').trim();
-		if (key.startsWith('pk_')) return key;
-	} catch (e) {
-		// Fallback sotto
-	}
-
-	return String(config.public.stripeKey || '').trim();
-};
-
+// Init Stripe and promo when mounted
 onMounted(async () => {
-	try {
-		stripePublishableKey.value = await resolveStripePublishableKey();
-		if (!stripePublishableKey.value || stripePublishableKey.value.includes('placeholder')) {
-			clearTimeout(stripeTimeout);
-			paymentError.value = 'Stripe non configurato correttamente. Inserisci le chiavi Stripe dal pannello Carte e Pagamenti.';
-			return;
-		}
-
-		const { loadStripe } = await import('@stripe/stripe-js');
-		const stripePromise = loadStripe(stripePublishableKey.value);
-		stripe = await stripePromise;
-		stripeReady.value = true;
-		clearTimeout(stripeTimeout);
-		// Se il metodo di pagamento selezionato e' carta e non c'e' una carta salvata, mostra il form Stripe
-		if (paymentMethod.value === 'carta' && !defaultPayment.value?.card) {
-			await mountCardElement();
-		}
-	} catch (e) {
-		console.error('Stripe load error:', e);
-		clearTimeout(stripeTimeout);
-		paymentError.value = 'Errore caricamento sistema pagamenti.';
-	}
-});
-
-// Recupera la carta di pagamento salvata dell'utente (se ne ha una)
-// lazy: true — i dati della carta salvata non servono al primo render,
-// vengono usati solo quando l'utente sceglie il metodo "carta"
-const { data: defaultPayment } = useSanctumFetch("/api/stripe/default-payment-method", { lazy: true });
-
-// Formatta il prezzo da centesimi a euro (es. 1200 -> "12,00€")
-const formatPrice = (cents) => {
-	if (!cents && cents !== 0) return '0€';
-	const euros = Number(cents) / 100;
-	return euros.toFixed(2).replace('.', ',') + '€';
-};
-
-// Pacchi da visualizzare: dall'ordine esistente o dal carrello
-const displayPackages = computed(() => {
-	if (existingOrder.value) return existingOrder.value.packages || [];
-	return cart.value?.data || [];
-});
-
-// Gruppi di indirizzi dal carrello (per mostrare quante spedizioni verranno create)
-const addressGroups = computed(() => cart.value?.meta?.address_groups || []);
-const hasMultipleGroups = computed(() => addressGroups.value.filter(g => g.count >= 1).length > 1);
-const mergeGroupsCount = computed(() => addressGroups.value.length);
-
-// Totale da visualizzare (come stringa formattata)
-const getTotal = computed(() => {
-	if (existingOrder.value) return existingOrder.value.subtotal || '0,00€';
-	return cart.value?.meta?.total || '0,00€';
-});
-
-// Totale come numero (per calcoli, es. 12.50)
-// Rimuove simbolo valuta, spazi, e converte formato italiano (1.200,50) in numero (1200.50)
-const getNumberTotal = computed(() => {
-	const cleaned = String(getTotal.value)
-		.replace(/[€\s\u00A0EUR]/gi, "")  // Rimuove simbolo euro, spazi e testo "EUR"
-		.replace(/\./g, "")                 // Rimuove separatore migliaia (punto in italiano)
-		.replace(",", ".");                 // Converte virgola decimale in punto
-	return Number(cleaned) || 0;
-});
-
-// Numero totale di pacchi (sommando le quantita')
-const totalPackages = computed(() => {
-	return displayPackages.value.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
-});
-
-// Descrizione del contenuto (tipi di pacco unici, es. "Pacco, Busta")
-const contentDescription = computed(() => {
-	if (!displayPackages.value.length) return '';
-	const types = displayPackages.value.map(item => item.package_type || 'Pacco').filter(Boolean);
-	return [...new Set(types)].join(', ');
-});
-
-// --- FATTURAZIONE ---
-const fatturazioneType = ref('ricevuta'); // 'ricevuta' o 'fattura'
-const fatturaData = ref({
-	ragione_sociale: '',
-	p_iva: '',
-	codice_fiscale: '',
-	indirizzo: '',
-	pec: '',
-	codice_sdi: '',
-});
-
-// --- WALLET (portafoglio interno) ---
-// Caricato in modo lazy per evitare problemi SSR
-const walletBalance = ref(0);
-const walletLoaded = ref(false);
-
-// Carica il saldo del wallet dall'API (una sola volta)
-const loadWalletBalance = async () => {
-	if (walletLoaded.value) return;
-	try {
-		const result = await sanctum("/api/wallet/balance");
-		walletBalance.value = Number(result?.balance ?? 0);
-		walletLoaded.value = true;
-	} catch (e) {
-		walletBalance.value = 0;
-		walletLoaded.value = true;
-	}
-};
-
-// Saldo wallet formattato (es. "25,00€")
-const walletFormatted = computed(() => walletBalance.value.toFixed(2).replace('.', ',') + '€');
-// Controlla se il saldo wallet e' sufficiente per pagare
-const walletSufficient = computed(() => walletBalance.value >= finalTotal.value);
-
-// --- COUPON / CODICE PROMOZIONALE ---
-const couponCode = ref('');           // Codice inserito dall'utente
-const couponLoading = ref(false);     // Stato di caricamento verifica coupon
-const couponError = ref(null);        // Messaggio di errore
-const couponApplied = ref(null);      // Dati del coupon applicato (tipo, sconto, codice)
-
-// Verifica il codice promozionale tramite API (gestisce sia coupon che codici referral)
-const validateCoupon = async () => {
-	if (!couponCode.value || couponCode.value.trim().length < 2) return;
-	couponLoading.value = true;
-	couponError.value = null;
-	couponApplied.value = null;
-	try {
-		// Endpoint unificato che gestisce sia coupon normali che codici referral
-		const result = await sanctum("/api/calculate-coupon", {
-			method: "POST",
-			body: { coupon: couponCode.value.trim().toUpperCase(), total: getNumberTotal.value },
-		});
-		if (result?.success) {
-			couponApplied.value = {
-				type: result.type || 'coupon',
-				discount_percent: result.percentage,
-				discount_amount: result.discount_amount,
-				pro_name: result.pro_user_name || '',
-				code: result.referral_code || couponCode.value.trim().toUpperCase(),
-			};
-		}
-	} catch (e) {
-		const data = e?.response?._data || e?.data;
-		couponError.value = data?.error || data?.message || "Codice non valido.";
-	} finally {
-		couponLoading.value = false;
-	}
-};
-
-// Applica automaticamente il codice referral se l'utente e' stato invitato da un altro utente
-const autoApplyReferral = async () => {
-	if (couponApplied.value) return;
-	try {
-		const result = await sanctum("/api/referral/my-discount");
-		if (result?.has_discount && result?.referral_code) {
-			couponCode.value = result.referral_code;
-			const discountAmount = Math.round(getNumberTotal.value * (result.discount_percent / 100) * 100) / 100;
-			couponApplied.value = {
-				type: 'referral',
-				discount_percent: result.discount_percent,
-				discount_amount: discountAmount,
-				pro_name: result.pro_name || '',
-				code: result.referral_code,
-			};
-		}
-	} catch (e) {
-		// Silently ignore - user may not have referral
-	}
-};
-
-onMounted(() => {
+	loadPriceBands();
+	await initStripe();
 	autoApplyReferral();
 });
 
-// Rimuove il coupon applicato
-const removeCoupon = () => {
-	couponApplied.value = null;
-	couponCode.value = '';
-	couponError.value = null;
-};
 
-// Totale finale dopo aver sottratto lo sconto del coupon (se applicato)
-const finalTotal = computed(() => {
-	if (couponApplied.value) {
-		return Math.max(0, getNumberTotal.value - couponApplied.value.discount_amount);
-	}
-	return getNumberTotal.value;
-});
-
-const finalTotalFormatted = computed(() => {
-	return finalTotal.value.toFixed(2).replace('.', ',') + '€';
-});
-
-// --- SELEZIONE METODO DI PAGAMENTO ---
-const paymentMethod = ref('carta'); // Metodo di default: carta di credito
-
-// Quando l'utente cambia metodo di pagamento, carica i dati necessari
-watch(paymentMethod, async (val) => {
-	if (val === 'wallet') {
-		await loadWalletBalance();
-	}
-	if (val === 'carta' && !defaultPayment.value?.card && stripeReady.value) {
-		await mountCardElement();
-	}
-});
-
-// --- ELEMENTO CARTA STRIPE ---
-const cardElement = ref(null);     // Riferimento all'elemento carta Stripe
-const cardMounted = ref(false);    // Se l'elemento carta e' stato montato nel DOM
-const cardComplete = ref(false);   // Se l'utente ha completato l'inserimento dei dati carta
-const cardError = ref(null);       // Errore di validazione della carta
-
-// Monta l'elemento carta Stripe nel contenitore #card-element
-const mountCardElement = async () => {
-	if (cardMounted.value || !stripe) return;
-
-	await nextTick();
-	const elements = stripe.elements();
-	cardElement.value = elements.create('card', {
-		style: {
-			base: {
-				fontSize: '15px',
-				color: '#252B42',
-				fontFamily: '"Inter", sans-serif',
-				'::placeholder': { color: '#A0A5AB' },
-			},
-			invalid: { color: '#EF4444' },
-		},
-		hidePostalCode: true,
-	});
-	const container = document.getElementById('card-element');
-	if (container) {
-		cardElement.value.mount('#card-element');
-		cardMounted.value = true;
-		cardElement.value.on('change', (event) => {
-			cardComplete.value = event.complete;
-			cardError.value = event.error?.message || null;
-		});
-	}
-};
-
-// Se true, l'utente vuole usare una nuova carta invece di quella salvata
-const useNewCard = ref(false);
-// Se true, la nuova carta viene salvata come predefinita per i prossimi pagamenti
-const saveCardForFuture = ref(true);
-
-// Quando l'utente sceglie di usare una nuova carta, monta l'elemento Stripe
-watch(useNewCard, async (val) => {
-	if (val && stripeReady.value) {
-		await nextTick();
-		await mountCardElement();
-	}
-});
-
-// --- TERMINI E CONDIZIONI ---
-const termsAccepted = ref(false);
-
-// --- CONFERMA PAGAMENTO ---
-const showConfirmModal = ref(false);
-
-// Mostra modal di conferma prima del pagamento
-const confirmPayment = () => {
-	if (!canPay.value) return;
-	showConfirmModal.value = true;
-};
-
-// Procede con il pagamento dopo conferma
-const proceedWithPayment = () => {
-	showConfirmModal.value = false;
-	processPayment();
-};
-
-// --- STATO DEL PAGAMENTO ---
-const isProcessing = ref(false);      // Pagamento in corso
-const paymentError = ref(null);       // Errore durante il pagamento
-const paymentSuccess = ref(false);    // Pagamento completato con successo
-const successOrderId = ref(null);     // ID dell'ordine pagato
-const paymentStep = ref('');          // Step corrente del pagamento (per UI)
-
-// Controlla se l'utente puo' procedere al pagamento
-// (termini accettati, metodo valido, dati completi)
-const canPay = computed(() => {
-	if (!termsAccepted.value) return false;
-	if (isProcessing.value) return false;
-	if (paymentMethod.value === 'paypal') return false;
-	if (paymentMethod.value === 'carta') {
-		if (defaultPayment.value?.card && !useNewCard.value) return true;
-		return cardComplete.value;
-	}
-	if (paymentMethod.value === 'bonifico') return true;
-	if (paymentMethod.value === 'wallet') return walletSufficient.value;
-	return false;
-});
-
-// Testo tooltip per il bottone di pagamento disabilitato (spiega perche' non si puo' pagare)
-const payButtonTooltip = computed(() => {
-	if (!termsAccepted.value) return 'Accetta i termini e condizioni per procedere.';
-	if (paymentMethod.value === 'paypal') return 'PayPal non e ancora disponibile.';
-	if (paymentMethod.value === 'wallet' && walletLoaded.value && !walletSufficient.value) return 'Saldo wallet insufficiente.';
-	if (paymentMethod.value === 'carta' && !defaultPayment.value?.card && !cardComplete.value) return 'Inserisci i dati della carta.';
-	return '';
-});
-
-// --- PROCESSO DI PAGAMENTO PRINCIPALE ---
-// Gestisce tutti i metodi di pagamento: carta (salvata/nuova), bonifico, wallet
-// Flusso: crea ordine -> applica referral -> esegui pagamento -> segna come pagato
-const processPayment = async () => {
-	if (!canPay.value) return;
-	isProcessing.value = true;
-	paymentError.value = null;
-	paymentStep.value = 'Validazione dati...';
-
-	// TASK 1: Validazione importo minimo Stripe
-	if (paymentMethod.value === 'carta' && finalTotal.value < 0.50) {
-		paymentError.value = 'Importo minimo per pagamento con carta: 0,50€';
-		isProcessing.value = false;
-		paymentStep.value = '';
-		return;
-	}
-
-	// TASK 2: Validazione form fatturazione
-	if (fatturazioneType.value === 'fattura') {
-		if (!fatturaData.value.ragione_sociale?.trim()) {
-			paymentError.value = 'Ragione Sociale obbligatoria per fattura';
-			isProcessing.value = false;
-			paymentStep.value = '';
-			return;
-		}
-		if (!fatturaData.value.p_iva?.trim()) {
-			paymentError.value = 'P.IVA obbligatoria per fattura';
-			isProcessing.value = false;
-			paymentStep.value = '';
-			return;
-		}
-		// Validazione formato P.IVA italiana (11 cifre)
-		const pivaClean = fatturaData.value.p_iva.replace(/\s/g, '');
-		if (!/^\d{11}$/.test(pivaClean)) {
-			paymentError.value = 'P.IVA non valida. Deve contenere 11 cifre.';
-			isProcessing.value = false;
-			paymentStep.value = '';
-			return;
-		}
-	}
-
-	try {
-		let orderIds = [];
-		const isExisting = !!existingOrderId.value;
-
-		paymentStep.value = 'Creazione ordine...';
-
-		if (isExisting) {
-			orderIds = [existingOrderId.value];
-		} else {
-			const orderResponse = await sanctum("/api/stripe/create-order", {
-				method: "POST",
-				body: { subtotal: Math.round(getNumberTotal.value * 100) },
-			});
-			// Supporta sia singolo order_id che multipli order_ids (raggruppamento per indirizzo)
-			orderIds = orderResponse.order_ids || [orderResponse.order_id];
-		}
-
-		const primaryOrderId = orderIds[0];
-
-		// Helper: solo svuota il carrello quando si paga dal carrello (non da un ordine esistente)
-		// Applica anche il codice referral DOPO il pagamento riuscito (non prima, per evitare commissioni su pagamenti falliti)
-		const onPaymentSuccess = async () => {
-			paymentStep.value = 'Finalizzazione...';
-			// Applica la commissione referral solo dopo che il pagamento e' andato a buon fine
-			if (couponApplied.value && couponApplied.value.type === 'referral') {
-				try {
-					await sanctum("/api/referral/apply", {
-						method: "POST",
-						body: {
-							code: couponApplied.value.code,
-							order_id: primaryOrderId,
-							order_amount: getNumberTotal.value,
-						},
-					});
-				} catch (e) {
-					console.warn('Referral apply warning:', e);
-				}
-			}
-
-			paymentSuccess.value = true;
-			successOrderId.value = orderIds.length > 1
-				? orderIds.join(', ')
-				: primaryOrderId;
-			if (!existingOrderId.value) {
-				clearNuxtData("cart");
-				await refreshNuxtData("cart");
-			}
-			paymentStep.value = '';
-		};
-
-		// Helper: processa il pagamento per un singolo ordine
-		// Viene chiamato per ogni ordine quando ce ne sono piu' di uno
-		const payOrder = async (orderId, isFirst) => {
-			if (orderIds.length > 1) {
-				paymentStep.value = `Pagamento ordine ${orderIds.indexOf(orderId) + 1} di ${orderIds.length}...`;
-			} else {
-				paymentStep.value = 'Elaborazione pagamento...';
-			}
-
-			if (paymentMethod.value === 'bonifico') {
-				await sanctum("/api/stripe/mark-order-completed", {
-					method: "POST",
-					body: {
-						order_id: orderId,
-						payment_type: 'bonifico',
-						is_existing_order: !!existingOrderId.value,
-					},
-				});
-				return true;
-			}
-
-			if (paymentMethod.value === 'wallet') {
-				// Per il wallet, calcoliamo l'importo per questo ordine specifico
-				const orderData = orderIds.length > 1
-					? await sanctum(`/api/orders/${orderId}`)
-					: null;
-				const orderAmount = orderData
-					? Number(String(orderData?.data?.subtotal || '0').replace(/[^0-9.,]/g, '').replace(',', '.'))
-					: finalTotal.value;
-
-				const walletResult = await sanctum("/api/wallet/pay", {
-					method: "POST",
-					body: {
-						amount: orderAmount,
-						reference: `order-${orderId}`,
-						description: `Pagamento ordine #${orderId}`,
-					},
-				});
-
-				if (walletResult?.success) {
-					await sanctum("/api/stripe/mark-order-completed", {
-						method: "POST",
-						body: {
-							order_id: orderId,
-							payment_type: 'wallet',
-							ext_id: `wallet-${walletResult?.data?.id || Date.now()}`,
-							is_existing_order: !!existingOrderId.value,
-						},
-					});
-					return true;
-				} else {
-					paymentError.value = walletResult?.message || "Pagamento con wallet non riuscito.";
-					return false;
-				}
-			}
-
-			if (paymentMethod.value === 'carta' && defaultPayment.value?.card && !useNewCard.value) {
-				const payEndpoint = isExisting ? '/api/stripe/existing-order-payment' : '/api/stripe/create-payment';
-				const payResult = await sanctum(payEndpoint, {
-					method: "POST",
-					body: {
-						order_id: orderId,
-						currency: "eur",
-						customer_id: user.value.customer_id,
-						payment_method_id: defaultPayment.value.card.id,
-					},
-				});
-
-				if (payResult.status === "succeeded") {
-					const paidEndpoint = isExisting ? '/api/stripe/existing-order-paid' : '/api/stripe/order-paid';
-					await sanctum(paidEndpoint, {
-						method: "POST",
-						body: {
-							order_id: orderId,
-							ext_id: payResult.payment_intent_id,
-							is_existing_order: isExisting,
-						},
-					});
-					return true;
-				} else if (payResult.status === "requires_action") {
-					paymentError.value = "La tua banca richiede autenticazione 3D Secure. Usa una nuova carta per completare l'autenticazione.";
-					return false;
-				} else {
-					paymentError.value = "Pagamento non riuscito. Stato: " + payResult.status;
-					return false;
-				}
-			}
-
-			if (paymentMethod.value === 'carta' && (useNewCard.value || !defaultPayment.value?.card)) {
-				const piEndpoint = isExisting ? '/api/stripe/existing-order-payment-intent' : '/api/stripe/create-payment-intent';
-				const piResponse = await sanctum(piEndpoint, {
-					method: "POST",
-					body: { order_id: orderId },
-				});
-
-				if (piResponse.error) {
-					paymentError.value = piResponse.error;
-					return false;
-				}
-
-				// FIXED: confirmCardPayment gestisce automaticamente 3D Secure (SCA)
-				// Stripe SDK mostra il modal 3DS quando richiesto dalla banca
-				const confirmationData = {
-					payment_method: { card: cardElement.value },
-					...(saveCardForFuture.value ? { setup_future_usage: 'off_session' } : {}),
-				};
-
-				const { error, paymentIntent } = await stripe.confirmCardPayment(
-					piResponse.client_secret,
-					confirmationData
-				);
-
-				if (error) {
-					// Messaggi user-friendly per errori comuni Stripe
-					const errorMessages = {
-						'card_declined': 'Carta rifiutata. Verifica i dati o usa un\'altra carta.',
-						'insufficient_funds': 'Fondi insufficienti sulla carta.',
-						'expired_card': 'Carta scaduta.',
-						'incorrect_cvc': 'Codice CVC non corretto.',
-						'incorrect_number': 'Numero carta non valido.',
-						'invalid_expiry_year': 'Anno di scadenza non valido.',
-						'invalid_expiry_month': 'Mese di scadenza non valido.',
-						'processing_error': 'Errore temporaneo. Riprova tra qualche minuto.',
-						'authentication_required': 'Autenticazione 3D Secure fallita.',
-						'payment_intent_authentication_failure': 'Autenticazione 3D Secure non riuscita.',
-					};
-					paymentError.value = errorMessages[error.code] || error.message;
-					return false;
-				}
-
-				// Gestione completa degli stati del PaymentIntent
-				if (paymentIntent.status === "succeeded") {
-					if (saveCardForFuture.value && paymentIntent.payment_method) {
-						try {
-							await sanctum('/api/stripe/set-default-payment-method', {
-								method: 'POST',
-								body: { payment_method: paymentIntent.payment_method },
-							});
-							await refreshNuxtData('/api/stripe/default-payment-method');
-						} catch (saveErr) {
-							console.warn('Save card warning:', saveErr);
-						}
-					}
-
-					const paidEndpoint = isExisting ? '/api/stripe/existing-order-paid' : '/api/stripe/order-paid';
-					await sanctum(paidEndpoint, {
-						method: "POST",
-						body: {
-							order_id: orderId,
-							ext_id: paymentIntent.id,
-							is_existing_order: isExisting,
-						},
-					});
-					return true;
-				} else if (paymentIntent.status === "requires_action") {
-					// Questo non dovrebbe accadere perché confirmCardPayment gestisce l'azione
-					paymentError.value = "Autenticazione 3D Secure richiesta ma non completata.";
-					return false;
-				} else if (paymentIntent.status === "processing") {
-					paymentError.value = "Pagamento in elaborazione. Controlla lo stato tra qualche minuto.";
-					return false;
-				} else if (paymentIntent.status === "requires_payment_method") {
-					paymentError.value = "Metodo di pagamento non valido. Riprova con un'altra carta.";
-					return false;
-				} else {
-					paymentError.value = "Stato pagamento: " + paymentIntent.status;
-					return false;
-				}
-			}
-
-			return false;
-		};
-
-		// FIXED: Gestione atomica ordini multipli
-		// Per ordini multipli, traccia quali sono stati pagati per gestire fallimenti parziali
-		const paidOrderIds = [];
-		let allSuccess = true;
-
-		for (let i = 0; i < orderIds.length; i++) {
-			const success = await payOrder(orderIds[i], i === 0);
-			if (success) {
-				paidOrderIds.push(orderIds[i]);
-			} else {
-				allSuccess = false;
-				// Se fallisce un ordine dopo che altri sono stati pagati, informa l'utente
-				if (paidOrderIds.length > 0) {
-					paymentError.value = `Attenzione: ${paidOrderIds.length} ordine/i pagato/i con successo (${paidOrderIds.join(', ')}), ma il pagamento dell'ordine ${orderIds[i]} è fallito. Contatta l'assistenza per completare l'ordine rimanente.`;
-				}
-				return;
-			}
-		}
-
-		if (allSuccess) {
-			await onPaymentSuccess();
-		}
-
-	} catch (err) {
-		console.error('Payment error:', err);
-		paymentError.value = err?.response?._data?.error || err?.response?._data?.message || err?.data?.error || err?.message || "Errore durante il pagamento. Riprova.";
-	} finally {
-		isProcessing.value = false;
-		paymentStep.value = '';
-	}
-};
 </script>
 
 <template>
 	<section class="min-h-[600px] py-[30px] desktop:py-[50px] bg-[#F0F0F0]">
 		<div class="my-container">
+			<div v-if="!pageReady" class="space-y-[16px] animate-pulse">
+				<div class="h-[64px] rounded-[16px] border border-[#E5EAEC] bg-white/90"></div>
+				<div class="grid grid-cols-1 desktop:grid-cols-[minmax(0,1.1fr)_360px] gap-[18px]">
+					<div class="rounded-[18px] border border-[#E5EAEC] bg-white p-[18px] tablet:p-[22px] space-y-[14px]">
+						<div class="h-[24px] w-[42%] rounded-[10px] bg-[#EEF3F5]"></div>
+						<div class="grid grid-cols-1 tablet:grid-cols-2 gap-[12px]">
+							<div class="h-[118px] rounded-[16px] bg-[#F4F7F9]"></div>
+							<div class="h-[118px] rounded-[16px] bg-[#F4F7F9]"></div>
+						</div>
+						<div class="h-[184px] rounded-[16px] bg-[#EEF3F5]"></div>
+					</div>
+					<div class="rounded-[18px] border border-[#E5EAEC] bg-white p-[18px] space-y-[14px]">
+						<div class="h-[22px] w-[58%] rounded-[10px] bg-[#EEF3F5]"></div>
+						<div class="h-[92px] rounded-[16px] bg-[#F4F7F9]"></div>
+						<div class="h-[56px] rounded-[999px] bg-[#D8DEE5]"></div>
+					</div>
+				</div>
+			</div>
+			<template v-else>
 			<!-- Steps -->
 			<Steps :current-step="4" />
 
@@ -764,11 +156,11 @@ const processPayment = async () => {
 								<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="22" height="18" rx="2"/><path d="M1 9h22"/></svg>
 							</div>
 							<div>
-								<h2 class="text-[1.25rem] font-bold text-[#252B42] leading-tight">{{ displayPackages.length <= 1 ? 'Riepilogo ordine' : 'Riepilogo ordini' }}</h2>
+								<h2 class="sf-section-title !text-[1.25rem] leading-tight">{{ displayPackages.length <= 1 ? 'Riepilogo ordine' : 'Riepilogo ordini' }}</h2>
 								<p class="text-[0.8125rem] text-[#737373]">{{ totalPackages }} {{ totalPackages === 1 ? 'spedizione' : 'spedizioni' }}<span v-if="contentDescription"> &middot; {{ contentDescription }}</span></p>
 							</div>
 						</div>
-						<NuxtLink v-if="!existingOrderId" to="/carrello" class="bg-[#E44203] text-white font-semibold text-[0.8125rem] px-[18px] py-[8px] rounded-[8px] hover:opacity-90 transition flex items-center gap-[6px]">
+						<NuxtLink v-if="!existingOrderId" to="/carrello" class="sf-action-pill sf-action-pill--accent">
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
 							Modifica
 						</NuxtLink>
@@ -918,237 +310,407 @@ const processPayment = async () => {
 								{{ finalTotalFormatted }}
 							</span>
 						</div>
-					</div>
-				</div>
 
-				<!-- Codice promozionale -->
-				<div class="bg-[#E6E6E6] rounded-[20px] p-[16px_12px] tablet:p-[24px_20px] desktop:p-[30px_36px]">
-					<h2 class="text-[1.25rem] font-bold text-[#252B42] mb-[16px]">Codice promozionale</h2>
-
-					<div v-if="couponApplied" class="flex items-center gap-[12px] bg-emerald-50 border border-emerald-200 rounded-[50px] p-[14px]">
-						<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-						<div class="flex-1">
-							<p class="text-[0.9375rem] font-semibold text-emerald-800">Codice {{ couponApplied.code }} applicato!</p>
-							<p class="text-[0.8125rem] text-emerald-700">Sconto del {{ couponApplied.discount_percent }}% da {{ couponApplied.pro_name }}</p>
-						</div>
-						<button type="button" @click="removeCoupon" class="inline-flex items-center gap-[4px] text-[0.8125rem] text-red-500 hover:underline font-medium cursor-pointer">
-							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-							Rimuovi
-						</button>
-					</div>
-					<div v-else class="flex flex-col tablet:flex-row gap-[12px]">
-						<input
-							v-model="couponCode"
-							type="text"
-							placeholder="Inserisci codice promozionale..."
-							maxlength="20"
-							class="flex-1 bg-white p-[12px_16px] border border-[#D0D0D0] rounded-[50px] text-[1rem] placeholder:text-[#A0A5AB] uppercase tracking-wider focus:border-[#095866] focus:outline-none"
-							@keyup.enter="validateCoupon" />
-						<button
-							type="button"
-							@click="validateCoupon"
-							:disabled="couponLoading || !couponCode.trim()"
-							class="inline-flex items-center justify-center gap-[6px] px-[24px] min-h-[48px] bg-[#095866] text-white rounded-[50px] font-semibold text-[0.875rem] hover:bg-[#074a56] transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer">
-							<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
-							{{ couponLoading ? 'Verifica...' : 'Applica' }}
-						</button>
-					</div>
-					<p v-if="couponError" class="text-red-500 text-[0.8125rem] mt-[8px]">{{ couponError }}</p>
-				</div>
-
-				<!-- Dettagli fatturazione -->
-				<div class="bg-[#E6E6E6] rounded-[20px] p-[16px_12px] tablet:p-[24px_20px] desktop:p-[30px_36px]">
-					<h2 class="text-[1.25rem] font-bold text-[#252B42] mb-[16px]">Dettagli fatturazione</h2>
-
-					<div class="flex items-center justify-between mb-[8px]">
-						<div>
-							<p class="text-[0.9375rem] text-[#252B42]">Importo servizi fatturati:</p>
-							<p class="text-[0.9375rem] font-semibold text-[#252B42]">{{ finalTotalFormatted }}</p>
-						</div>
-					</div>
-
-					<div class="flex flex-wrap gap-[10px] mt-[20px]">
-						<button type="button" @click="fatturazioneType = 'ricevuta'"
-							:class="fatturazioneType === 'ricevuta' ? 'bg-white border-[#252B42] text-[#252B42]' : 'bg-white border-[#D0D0D0] text-[#737373]'"
-							class="flex-1 tablet:flex-none min-w-[140px] px-[24px] min-h-[44px] rounded-[8px] text-[0.875rem] font-medium cursor-pointer transition-colors border">
-							Ricevuta
-						</button>
-						<button type="button" @click="fatturazioneType = 'fattura'"
-							:class="fatturazioneType === 'fattura' ? 'bg-white border-[#252B42] text-[#252B42]' : 'bg-white border-[#D0D0D0] text-[#737373]'"
-							class="flex-1 tablet:flex-none min-w-[140px] px-[24px] min-h-[44px] rounded-[8px] text-[0.875rem] font-medium cursor-pointer transition-colors border">
-							Fattura
-						</button>
-					</div>
-
-					<div v-if="fatturazioneType === 'fattura'" class="space-y-[12px] mt-[16px]">
-						<div>
-							<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[4px]">Ragione Sociale *</label>
-							<input v-model="fatturaData.ragione_sociale" type="text" placeholder="Ragione Sociale" class="w-full bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[8px] text-[1rem] placeholder:text-[#A0A5AB] focus:border-[#095866] focus:outline-none transition-colors" />
-						</div>
-						<div class="grid grid-cols-1 tablet:grid-cols-2 gap-[12px]">
-							<div>
-								<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[4px]">P. IVA *</label>
-								<input v-model="fatturaData.p_iva" type="text" placeholder="P. IVA" class="w-full bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[8px] text-[1rem] placeholder:text-[#A0A5AB] focus:border-[#095866] focus:outline-none transition-colors" />
+						<div class="mt-[8px] border-t border-[#F0F0F0] pt-[12px]">
+							<div class="flex flex-col tablet:flex-row tablet:items-center tablet:justify-between gap-[10px]">
+								<div class="min-w-0">
+									<p class="text-[0.875rem] font-medium text-[#252B42]">Codice promozionale o referral</p>
+									<p class="text-[0.75rem] text-[#6B7280] leading-[1.5]">Mostralo solo se hai davvero un codice da applicare.</p>
+								</div>
+								<button
+									type="button"
+									@click="couponPanelOpen = !couponPanelOpen"
+									class="inline-flex items-center gap-[8px] text-[0.8125rem] font-semibold text-[#095866] hover:opacity-80 transition cursor-pointer">
+									<span>{{ couponApplied ? 'Gestisci codice' : (couponPanelOpen ? 'Nascondi codice' : 'Hai un codice?') }}</span>
+									<svg
+										:class="couponPanelOpen ? 'rotate-180' : ''"
+										width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+										class="transition-transform duration-200 shrink-0">
+										<polyline points="6 9 12 15 18 9" />
+									</svg>
+								</button>
 							</div>
-							<div>
-								<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[4px]">Codice Fiscale</label>
-								<input v-model="fatturaData.codice_fiscale" type="text" placeholder="CF" class="w-full bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[8px] text-[1rem] placeholder:text-[#A0A5AB] focus:border-[#095866] focus:outline-none transition-colors" />
-							</div>
-						</div>
-						<div>
-							<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[4px]">Indirizzo</label>
-							<input v-model="fatturaData.indirizzo" type="text" placeholder="Indirizzo completo" class="w-full bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[8px] text-[1rem] placeholder:text-[#A0A5AB] focus:border-[#095866] focus:outline-none transition-colors" />
-						</div>
-						<div class="grid grid-cols-1 tablet:grid-cols-2 gap-[12px]">
-							<div>
-								<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[4px]">PEC</label>
-								<input v-model="fatturaData.pec" type="email" placeholder="email@pec.it" class="w-full bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[8px] text-[1rem] placeholder:text-[#A0A5AB] focus:border-[#095866] focus:outline-none transition-colors" />
-							</div>
-							<div>
-								<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[4px]">Codice SDI</label>
-								<input v-model="fatturaData.codice_sdi" type="text" placeholder="0000000" maxlength="7" class="w-full bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[8px] text-[1rem] placeholder:text-[#A0A5AB] focus:border-[#095866] focus:outline-none transition-colors" />
-							</div>
+
+							<Transition name="payment-panel">
+								<div v-if="couponPanelOpen" class="mt-[12px]">
+									<div v-if="couponApplied" class="flex flex-col tablet:flex-row tablet:items-center gap-[10px] rounded-[16px] border border-emerald-200 bg-emerald-50 px-[14px] py-[12px]">
+										<div class="flex items-start gap-[10px] min-w-0 flex-1">
+											<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mt-[2px] shrink-0"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+											<div class="min-w-0">
+												<p class="text-[0.875rem] font-semibold text-emerald-800">Codice {{ couponApplied.code }} applicato</p>
+												<p class="text-[0.75rem] text-emerald-700 leading-[1.5]">Sconto del {{ couponApplied.discount_percent }}% già incluso nel totale.</p>
+											</div>
+										</div>
+										<button type="button" @click="removeCoupon" class="inline-flex items-center gap-[4px] text-[0.8125rem] text-red-500 hover:underline font-medium cursor-pointer shrink-0">
+											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+											Rimuovi
+										</button>
+									</div>
+									<div v-else class="flex flex-col tablet:flex-row gap-[10px]">
+										<input
+											v-model="couponCode"
+											type="text"
+											placeholder="Inserisci codice promozionale"
+											maxlength="20"
+											class="flex-1 bg-white p-[12px_14px] border border-[#D0D0D0] rounded-[14px] text-[0.9375rem] placeholder:text-[#A0A5AB] uppercase tracking-[0.04em] focus:border-[#095866] focus:outline-none"
+											@keyup.enter="validateCoupon" />
+										<button
+											type="button"
+											@click="validateCoupon"
+											:disabled="couponLoading || !couponCode.trim()"
+											class="inline-flex items-center justify-center gap-[6px] px-[20px] min-h-[48px] bg-[#095866] text-white rounded-[14px] font-semibold text-[0.875rem] hover:bg-[#074a56] transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer">
+											<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+											{{ couponLoading ? 'Verifica...' : 'Applica' }}
+										</button>
+									</div>
+									<div class="min-h-[20px] mt-[8px]">
+										<p v-if="couponError" class="text-red-500 text-[0.8125rem]">{{ couponError }}</p>
+									</div>
+								</div>
+							</Transition>
 						</div>
 					</div>
 				</div>
 
-				<!-- Metodi di pagamento -->
-				<div class="bg-[#E6E6E6] rounded-[20px] p-[16px_12px] tablet:p-[24px_20px] desktop:p-[30px_36px]">
-					<h2 class="text-[1.25rem] font-bold text-[#252B42] mb-[20px]">Metodi di pagamento</h2>
-
-					<div class="grid grid-cols-1 tablet:grid-cols-2 desktop:flex desktop:flex-wrap gap-[10px] tablet:gap-[12px] mb-[20px]">
-						<button type="button" @click="paymentMethod = 'bonifico'"
-							:class="paymentMethod === 'bonifico' ? 'border-[#252B42] bg-white' : 'border-[#D0D0D0] bg-white'"
-							class="flex items-center gap-[8px] px-[16px] tablet:px-[20px] py-[14px] min-h-[48px] rounded-[8px] text-[0.875rem] font-medium cursor-pointer transition-colors border">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#095866" stroke-width="2" class="shrink-0"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M2 10h20"/></svg>
-							<span class="text-[#252B42]">Bonifico bancario</span>
-						</button>
-						<button type="button" @click="paymentMethod = 'paypal'"
-							:class="paymentMethod === 'paypal' ? 'border-[#252B42] bg-white' : 'border-[#D0D0D0] bg-white'"
-							class="flex items-center gap-[8px] px-[16px] tablet:px-[20px] py-[14px] min-h-[48px] rounded-[8px] text-[0.875rem] font-medium cursor-pointer transition-colors border relative">
-							<span class="text-[#003087] font-bold text-[0.875rem]">P</span>
-							<span class="text-[#252B42]">PayPal</span>
-							<span class="text-[0.6875rem] text-[#A0A5AB] font-normal">(presto)</span>
-						</button>
-						<button type="button" @click="paymentMethod = 'carta'"
-							:class="paymentMethod === 'carta' ? 'border-[#252B42] bg-white' : 'border-[#D0D0D0] bg-white'"
-							class="flex items-center gap-[8px] px-[16px] tablet:px-[20px] py-[14px] min-h-[48px] rounded-[8px] text-[0.875rem] font-medium cursor-pointer transition-colors border">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#095866" stroke-width="2" class="shrink-0"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
-							<span class="text-[#252B42]">Carta di credito/debito</span>
-						</button>
-						<button type="button" @click="paymentMethod = 'wallet'"
-							:class="paymentMethod === 'wallet' ? 'border-[#252B42] bg-white' : 'border-[#D0D0D0] bg-white'"
-							class="flex items-center gap-[8px] px-[16px] tablet:px-[20px] py-[14px] min-h-[48px] rounded-[8px] text-[0.875rem] font-medium cursor-pointer transition-colors border">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#095866" stroke-width="2" class="shrink-0"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
-							<span class="text-[#252B42]">Wallet</span>
-							<span v-if="walletLoaded" class="text-[0.75rem] text-[#095866] font-semibold">({{ walletFormatted }})</span>
-						</button>
-					</div>
-
-					<div v-if="paymentMethod === 'carta'">
-						<div v-if="defaultPayment?.card && !useNewCard" class="mb-[16px]">
-							<div class="flex items-center gap-[12px] p-[14px] bg-white rounded-[12px] border border-[#D0D0D0]">
-								<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#095866" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
-								<div class="flex-1">
-									<p class="text-[0.875rem] font-semibold text-[#252B42]">{{ defaultPayment.card.brand?.toUpperCase() }} **** {{ defaultPayment.card.last4 }}</p>
-									<p class="text-[0.75rem] text-[#737373]">Scade {{ defaultPayment.card.exp_month }}/{{ defaultPayment.card.exp_year }}</p>
+					<div class="checkout-payment-stack">
+						<!-- Metodi di pagamento -->
+						<div class="checkout-stage-card checkout-stage-card--payment checkout-motion-card" style="--checkout-delay: 80ms;">
+							<div class="checkout-panel-head">
+								<span class="checkout-panel-head__icon">
+									<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+								</span>
+								<div class="checkout-panel-head__copy">
+									<p class="checkout-panel-head__title">Metodo di pagamento</p>
+									<p class="checkout-panel-head__text">Scegli come pagare.</p>
 								</div>
 							</div>
-							<button type="button" @click="useNewCard = true" class="mt-[10px] text-[0.8125rem] text-[#095866] hover:underline cursor-pointer font-medium">Usa una nuova carta</button>
-						</div>
-						<div v-if="!defaultPayment?.card || useNewCard">
-							<div v-if="useNewCard && defaultPayment?.card" class="mb-[10px]">
-								<button type="button" @click="useNewCard = false" class="text-[0.8125rem] text-[#095866] hover:underline cursor-pointer font-medium">&larr; Usa carta salvata</button>
+
+							<div class="checkout-payment-options-grid">
+								<button
+									v-for="option in paymentMethodOptions"
+									:key="option.key"
+									type="button"
+									@click="selectPaymentMethod(option.key)"
+									:disabled="option.key === 'carta' && cardPaymentsUnavailable"
+									:class="[
+										'checkout-payment-option no-radius',
+										paymentMethod === option.key ? 'checkout-payment-option--active' : 'checkout-payment-option--idle',
+										option.key === 'carta' && cardPaymentsUnavailable ? 'checkout-payment-option--disabled' : '',
+									]">
+									<span v-if="option.badge" class="checkout-payment-option__badge">{{ option.badge }}</span>
+									<span class="checkout-payment-option__icon-shell">
+										<svg v-if="option.key === 'carta'" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+										<svg v-else-if="option.key === 'bonifico'" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10h18"/><path d="M5 10V7a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v3"/><rect x="4" y="10" width="16" height="9" rx="2"/><path d="M8 14h2"/><path d="M14 14h2"/></svg>
+										<svg v-else width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
+									</span>
+									<span class="checkout-payment-option__copy">
+										<span class="checkout-payment-option__title">{{ option.title }}</span>
+										<span class="checkout-payment-option__text">{{ option.description }}</span>
+									</span>
+								</button>
 							</div>
-							<label class="block text-[0.8125rem] font-medium text-[#252B42] mb-[8px]">Dati carta</label>
-							<div id="card-element" class="p-[14px] bg-white border border-[#D0D0D0] rounded-[12px]"></div>
-							<label class="mt-[10px] flex items-start gap-[8px] cursor-pointer">
-								<input type="checkbox" v-model="saveCardForFuture" class="w-[16px] h-[16px] min-w-[16px] accent-[#095866] mt-[2px] cursor-pointer" />
-								<span class="text-[0.8125rem] text-[#252B42] leading-[1.4]">Salva questa carta per i prossimi pagamenti</span>
-							</label>
-							<p v-if="cardError" class="text-red-500 text-[0.75rem] mt-[6px]">{{ cardError }}</p>
+
+							<div v-if="cardPaymentsUnavailable" class="checkout-payment-notice">
+								{{ cardPaymentsNotice }}
+							</div>
+
+							<div class="payment-panel-shell checkout-payment-panel" :data-payment-method="paymentMethod">
+									<div v-if="paymentMethod === 'carta' && !cardPaymentsUnavailable" class="space-y-[14px]">
+										<div class="checkout-payment-choice-stack">
+											<button
+												v-if="hasSavedCard"
+												type="button"
+												@click="useNewCard = false"
+												:class="['checkout-payment-choice no-radius', !useNewCard ? 'checkout-payment-choice--selected' : 'checkout-payment-choice--idle']">
+												<span class="checkout-payment-choice__brand">{{ defaultPayment.card.brand?.toUpperCase() }}</span>
+												<div class="checkout-payment-choice__copy">
+													<p class="checkout-payment-choice__eyebrow">Carta salvata</p>
+													<p class="checkout-payment-choice__title">•••• •••• •••• {{ defaultPayment.card.last4 }}</p>
+													<p class="checkout-payment-choice__text">Scade {{ defaultPayment.card.exp_month }}/{{ defaultPayment.card.exp_year }}</p>
+												</div>
+												<span :class="['checkout-payment-choice__radio', !useNewCard ? 'checkout-payment-choice__radio--selected' : '']"></span>
+											</button>
+
+											<div
+												role="button"
+												tabindex="0"
+												@click="useNewCard = true"
+												@keydown.enter.prevent="useNewCard = true"
+												@keydown.space.prevent="useNewCard = true"
+												:class="[
+													'checkout-payment-choice checkout-payment-choice--expandable no-radius',
+													(!hasSavedCard || useNewCard) ? 'checkout-payment-choice--selected' : 'checkout-payment-choice--idle'
+												]">
+												<div class="checkout-payment-choice__header">
+													<span class="checkout-payment-choice__icon-shell">
+														<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+													</span>
+													<div class="checkout-payment-choice__copy">
+														<p class="checkout-payment-choice__title">Usa una nuova carta</p>
+														<p class="checkout-payment-choice__text">Inserisci una carta diversa per questo pagamento.</p>
+													</div>
+													<span :class="['checkout-payment-choice__radio', (!hasSavedCard || useNewCard) ? 'checkout-payment-choice__radio--selected' : '']"></span>
+												</div>
+
+												<Transition name="payment-panel">
+													<div v-if="shouldShowCardForm" class="checkout-payment-card-form checkout-payment-card-form--embedded">
+														<div class="checkout-payment-card-form__head">
+															<div class="checkout-payment-card-form__intro">
+																<p class="checkout-payment-card-form__text">Inserisci la carta qui.</p>
+															</div>
+														</div>
+
+														<div id="card-element" ref="cardElementContainer" class="checkout-payment-card-form__element"></div>
+														<p v-if="stripeLoading" class="checkout-payment-card-form__helper">Preparazione del modulo carta in corso...</p>
+														<p v-if="cardError" class="checkout-payment-card-form__error">{{ cardError }}</p>
+														<label class="checkout-payment-card-form__save" @click.stop>
+															<input type="checkbox" v-model="saveCardForFuture" class="checkout-payment-card-form__checkbox" />
+															<span>Salva per i prossimi pagamenti</span>
+														</label>
+													</div>
+												</Transition>
+											</div>
+										</div>
+									</div>
+
+									<div v-else-if="paymentMethod === 'bonifico'" class="checkout-payment-alt">
+										<p class="checkout-payment-alt__title">Pagamento tramite bonifico</p>
+										<p class="checkout-payment-alt__text">Riceverai via email le coordinate bancarie appena confermi l'ordine. L'attivazione avviene alla ricezione del bonifico.</p>
+									</div>
+
+									<div v-else-if="paymentMethod === 'wallet'" class="checkout-payment-alt">
+										<p class="checkout-payment-alt__title">Pagamento tramite Wallet</p>
+										<p class="checkout-payment-alt__text">Saldo disponibile: <span class="font-semibold text-[#095866]">{{ walletFormatted }}</span></p>
+										<p v-if="walletLoaded && !walletSufficient" class="checkout-payment-alt__error">Saldo insufficiente. Ricarica il wallet per procedere.</p>
+										<p v-else-if="walletLoaded" class="checkout-payment-alt__success">Saldo sufficiente per completare il pagamento.</p>
+									</div>
+								</div>
+						</div>
+
+						<!-- Documento fiscale -->
+						<div class="checkout-stage-card checkout-stage-card--billing checkout-motion-card" style="--checkout-delay: 140ms;">
+							<div class="checkout-panel-head">
+								<span class="checkout-panel-head__icon">
+									<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8"/><path d="M8 11h8"/><path d="M8 15h5"/></svg>
+								</span>
+								<div class="checkout-panel-head__copy">
+									<p class="checkout-panel-head__title">Documento fiscale</p>
+								</div>
+							</div>
+
+							<div class="checkout-billing-segment">
+								<div class="checkout-billing-pill-row">
+									<button
+										type="button"
+										@click="fatturazioneType = 'ricevuta'"
+										:class="fatturazioneType === 'ricevuta' ? 'checkout-billing-pill--active' : 'checkout-billing-pill--idle'"
+										class="checkout-billing-pill no-radius">
+										Ricevuta
+									</button>
+									<button
+										type="button"
+										@click="fatturazioneType = 'fattura'"
+										:class="fatturazioneType === 'fattura' ? 'checkout-billing-pill--active' : 'checkout-billing-pill--idle'"
+										class="checkout-billing-pill no-radius">
+										Fattura
+									</button>
+								</div>
+							</div>
+
+							<Transition name="payment-panel">
+								<div v-if="fatturazioneType === 'fattura'" key="fattura" class="checkout-billing-reveal">
+									<div class="checkout-billing-context-note">
+										<p class="checkout-billing-context-note__title">Intestazione</p>
+										<p class="checkout-billing-context-note__text">Modifica solo se serve.</p>
+										<p v-if="billingShippingFullAddress" class="checkout-billing-context-note__prefill">
+											Base attuale: {{ billingShippingFullAddress }}
+										</p>
+									</div>
+									<div class="checkout-billing-segment checkout-billing-segment--sub">
+										<div class="checkout-billing-subpill-row">
+											<button
+												type="button"
+												@click="invoiceSubjectType = 'azienda'"
+												:class="invoiceSubjectType === 'azienda' ? 'checkout-billing-subpill--active' : 'checkout-billing-subpill--idle'"
+												class="checkout-billing-subpill no-radius">
+												Azienda
+											</button>
+											<button
+												type="button"
+												@click="invoiceSubjectType = 'privato'"
+												:class="invoiceSubjectType === 'privato' ? 'checkout-billing-subpill--active' : 'checkout-billing-subpill--idle'"
+												class="checkout-billing-subpill no-radius">
+												Privato
+											</button>
+										</div>
+									</div>
+
+									<Transition name="payment-panel">
+										<div v-if="invoiceSubjectType === 'azienda'" key="azienda" class="checkout-billing-fields">
+											<div class="checkout-billing-grid checkout-billing-grid--company-top">
+												<div>
+													<label class="checkout-billing-label">Ragione Sociale</label>
+													<input v-model="fatturaData.ragione_sociale" type="text" placeholder="SpediamoFacile S.r.l." class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Partita IVA</label>
+													<input v-model="fatturaData.p_iva" type="text" placeholder="IT 01234567890" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Codice Fiscale</label>
+													<input v-model="fatturaData.codice_fiscale" type="text" placeholder="01234567890" class="checkout-billing-input" />
+												</div>
+											</div>
+
+											<div class="checkout-billing-grid checkout-billing-grid--company-mid">
+												<div>
+													<label class="checkout-billing-label">Codice SDI</label>
+													<input v-model="fatturaData.codice_sdi" type="text" maxlength="7" placeholder="XXXXXXX" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">PEC (alternativa)</label>
+													<input v-model="fatturaData.pec" type="email" placeholder="fattura@pec.azienda.it" class="checkout-billing-input" />
+												</div>
+											</div>
+
+											<div class="checkout-billing-grid checkout-billing-grid--address">
+												<div>
+													<label class="checkout-billing-label">Indirizzo</label>
+													<input v-model="fatturaData.indirizzo" type="text" placeholder="Indirizzo" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Città</label>
+													<input v-model="fatturaData.city" type="text" placeholder="Città" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Prov.</label>
+													<input v-model="fatturaData.province" type="text" maxlength="2" placeholder="Prov." class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">CAP</label>
+													<input v-model="fatturaData.postal_code" type="text" maxlength="10" placeholder="CAP" class="checkout-billing-input" />
+												</div>
+											</div>
+										</div>
+
+										<div v-else key="privato" class="checkout-billing-fields">
+											<div class="checkout-billing-grid checkout-billing-grid--private-top">
+												<div>
+													<label class="checkout-billing-label">Nome completo</label>
+													<input v-model="fatturaData.nome_completo" type="text" placeholder="Nome e Cognome" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Codice Fiscale</label>
+													<input v-model="fatturaData.codice_fiscale" type="text" placeholder="Codice Fiscale" class="checkout-billing-input" />
+												</div>
+											</div>
+
+											<div class="checkout-billing-grid checkout-billing-grid--address">
+												<div>
+													<label class="checkout-billing-label">Indirizzo</label>
+													<input v-model="fatturaData.indirizzo" type="text" placeholder="Indirizzo" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Città</label>
+													<input v-model="fatturaData.city" type="text" placeholder="Città" class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">Prov.</label>
+													<input v-model="fatturaData.province" type="text" maxlength="2" placeholder="Prov." class="checkout-billing-input" />
+												</div>
+												<div>
+													<label class="checkout-billing-label">CAP</label>
+													<input v-model="fatturaData.postal_code" type="text" maxlength="10" placeholder="CAP" class="checkout-billing-input" />
+												</div>
+											</div>
+										</div>
+									</Transition>
+								</div>
+								<div v-else key="ricevuta" class="checkout-billing-receipt-note">
+									<p>Usiamo i dati del checkout.</p>
+								</div>
+							</Transition>
+						</div>
+
+						<div class="checkout-payment-footer checkout-motion-card" style="--checkout-delay: 200ms;">
+							<div class="checkout-payment-footer__summary">
+								<div class="checkout-payment-footer__summary-copy">
+									<p class="checkout-payment-footer__summary-label">Totale da pagare</p>
+									<p class="checkout-payment-footer__summary-value">{{ finalTotalFormatted }}</p>
+								</div>
+								<span class="checkout-payment-footer__summary-chip">{{ paymentMethod === 'bonifico' ? 'Pagamento differito' : 'Pagamento sicuro' }}</span>
+							</div>
+
+							<button type="button" @click="confirmPayment" :disabled="!canPay"
+								:class="['checkout-payment-submit', canPay ? 'checkout-payment-submit--active' : 'checkout-payment-submit--disabled']">
+								<svg v-if="isProcessing" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg>
+								<svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+								<span>{{ paymentActionLabel }}</span>
+								<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+							</button>
+
+							<div class="checkout-payment-footer__support">
+								<label class="checkout-payment-footer__terms">
+									<input type="checkbox" v-model="termsAccepted" class="checkout-payment-footer__checkbox" />
+									<span>
+										Ho letto e accetto i
+										<NuxtLink to="/termini-condizioni" class="checkout-payment-footer__terms-link">Termini e condizioni</NuxtLink>
+									</span>
+								</label>
+								<p class="checkout-payment-footer__hint">{{ payButtonTooltip || 'Controlla i dati e conferma.' }}</p>
+							</div>
+						</div>
+
+						<div class="checkout-payment-status">
+							<p v-if="paymentError" class="checkout-payment-status__error">
+								<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+								<span>{{ paymentError }}</span>
+							</p>
+
+							<div v-if="isProcessing && paymentStep" class="checkout-payment-status__progress">
+								<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 animate-spin"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg>
+								<span>{{ paymentStep }}</span>
+							</div>
 						</div>
 					</div>
-
-					<div v-if="paymentMethod === 'bonifico'" class="bg-white rounded-[50px] p-[16px] text-[0.8125rem] text-[#737373] leading-[1.6]">
-						<p class="font-semibold text-[#252B42] mb-[6px]">Pagamento tramite bonifico bancario</p>
-						<p>Dopo aver confermato l'ordine, riceverai le coordinate bancarie via email.</p>
-					</div>
-
-					<div v-if="paymentMethod === 'paypal'" class="bg-white rounded-[50px] p-[16px] text-[0.8125rem] text-[#737373] leading-[1.6]">
-						<p class="font-semibold text-[#252B42] mb-[6px]">Pagamento tramite PayPal</p>
-						<p>Il pagamento tramite PayPal sarà disponibile a breve. Seleziona un altro metodo di pagamento per procedere.</p>
-					</div>
-
-					<div v-if="paymentMethod === 'wallet'" class="bg-white rounded-[50px] p-[16px] text-[0.8125rem] text-[#737373] leading-[1.6]">
-						<p class="font-semibold text-[#252B42] mb-[6px]">Pagamento tramite Wallet</p>
-						<p>Saldo disponibile: <span class="font-bold text-[#095866]">{{ walletFormatted }}</span></p>
-						<p v-if="walletLoaded && !walletSufficient" class="text-red-500 mt-[8px] font-medium">Saldo insufficiente. Ricarica il tuo wallet per procedere.</p>
-						<p v-else-if="walletLoaded" class="text-emerald-600 mt-[8px]">Saldo sufficiente per completare il pagamento.</p>
-					</div>
-
-					<div class="mt-[20px]">
-						<label class="flex items-start gap-[10px] cursor-pointer py-[4px]">
-							<input type="checkbox" v-model="termsAccepted" class="w-[20px] h-[20px] min-w-[20px] accent-[#095866] mt-[2px] shrink-0 cursor-pointer" />
-							<span class="text-[0.8125rem] text-[#737373] leading-[1.5]">Ho letto e accetto i <NuxtLink to="/termini-condizioni" class="text-[#095866] hover:underline font-medium">Termini e condizioni</NuxtLink></span>
-						</label>
-					</div>
-				</div>
-
-				<p v-if="paymentError" class="text-red-500 text-[0.875rem] bg-red-50 p-[14px] rounded-[50px] border border-red-200 flex items-center gap-[10px]">
-					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-					<span>{{ paymentError }}</span>
-				</p>
-
-				<!-- Payment progress indicator -->
-				<div v-if="isProcessing && paymentStep" class="bg-blue-50 border border-blue-200 rounded-[50px] p-[14px] flex items-center gap-[10px]">
-					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 animate-spin"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg>
-					<span class="text-[0.875rem] text-blue-700 font-medium">{{ paymentStep }}</span>
-				</div>
-
-				<div class="flex flex-col items-center gap-[8px]">
-					<button type="button" @click="confirmPayment" :disabled="!canPay"
-						:class="[
-							'w-full tablet:w-auto px-[24px] tablet:px-[40px] py-[16px] min-h-[52px] rounded-[30px] text-white font-semibold text-[1rem] transition-[background-color,opacity,transform] flex items-center justify-center gap-[8px]',
-							canPay ? 'bg-[#E44203] hover:opacity-90 cursor-pointer' : 'bg-gray-300 cursor-not-allowed',
-						]">
-						<svg v-if="isProcessing" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg>
-						<svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-						<span v-if="isProcessing">Elaborazione...</span>
-						<span v-else>Completa il pagamento {{ finalTotalFormatted }}</span>
-					</button>
-					<p v-if="!canPay && payButtonTooltip" class="text-[0.8125rem] text-[#737373]">{{ payButtonTooltip }}</p>
 				</div>
 
 				<!-- Confirmation Modal -->
 				<Teleport to="body">
-					<div v-if="showConfirmModal" class="fixed inset-0 z-[9999] flex items-center justify-center p-[20px] bg-black/50 backdrop-blur-sm" @click.self="showConfirmModal = false">
-						<div class="bg-white rounded-[20px] p-[24px] max-w-[480px] w-full shadow-2xl animate-[scale-in_0.2s_ease-out]">
-							<div class="flex items-center gap-[12px] mb-[16px]">
-								<div class="w-[48px] h-[48px] bg-[#E44203]/10 rounded-full flex items-center justify-center shrink-0">
+					<div v-if="showConfirmModal" class="fixed inset-0 z-[9999] flex items-center justify-center p-[20px] bg-[#09131c]/36 backdrop-blur-[6px]" @click.self="showConfirmModal = false">
+						<div class="sf-modal-surface w-full max-w-[480px] animate-[scale-in_0.2s_ease-out]">
+							<div class="sf-modal-content">
+								<div class="sf-modal-header">
+									<div class="sf-modal-header__main">
+										<div class="sf-modal-icon sf-modal-icon--accent">
 									<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E44203" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-								</div>
-								<h3 class="text-[1.25rem] font-bold text-[#252B42]">Conferma pagamento</h3>
-							</div>
-							<p class="text-[0.9375rem] text-[#737373] mb-[20px] leading-[1.6]">
+										</div>
+										<div>
+											<h3 class="sf-modal-title">Conferma pagamento</h3>
+											<p class="sf-modal-description">
 								Stai per pagare <span class="font-bold text-[#252B42]">{{ finalTotalFormatted }}</span>
 								<template v-if="paymentMethod === 'carta'">con carta di credito</template>
 								<template v-else-if="paymentMethod === 'bonifico'">tramite bonifico bancario</template>
 								<template v-else-if="paymentMethod === 'wallet'">con il tuo wallet</template>
 								per <span class="font-bold text-[#252B42]">{{ totalPackages }} {{ totalPackages === 1 ? 'spedizione' : 'spedizioni' }}</span>.
-							</p>
-							<div class="flex gap-[12px]">
-								<button type="button" @click="showConfirmModal = false" class="flex-1 px-[20px] py-[12px] min-h-[48px] border border-[#D0D0D0] text-[#737373] rounded-[50px] font-medium text-[0.9375rem] hover:bg-gray-50 transition cursor-pointer">
+											</p>
+										</div>
+									</div>
+								</div>
+								<div class="sf-modal-divider" />
+								<div class="sf-modal-actions">
+								<button type="button" @click="showConfirmModal = false" class="btn-secondary flex-1 min-h-[48px]">
 									Annulla
 								</button>
-								<button type="button" @click="proceedWithPayment" class="flex-1 px-[20px] py-[12px] min-h-[48px] bg-[#E44203] text-white rounded-[50px] font-semibold text-[0.9375rem] hover:opacity-90 transition cursor-pointer">
+								<button type="button" @click="proceedWithPayment" class="btn-cta flex-1 min-h-[48px]">
 									Conferma
 								</button>
+								</div>
 							</div>
 						</div>
 					</div>
 				</Teleport>
-			</div>
+			</template>
 		</div>
 	</section>
 </template>
@@ -1187,6 +749,947 @@ const processPayment = async () => {
 	100% {
 		stroke-dasharray: 100 100;
 		stroke-dashoffset: 0;
+	}
+}
+
+@keyframes checkout-fade-up {
+	from {
+		opacity: 0;
+		transform: translateY(18px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+.payment-panel-shell {
+	min-height: 0;
+}
+
+.payment-panel-enter-active,
+.payment-panel-leave-active {
+	transition: opacity 0.2s cubic-bezier(0.22, 1, 0.36, 1), transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.payment-panel-enter-from,
+.payment-panel-leave-to {
+	opacity: 0;
+	transform: translateY(8px);
+}
+
+.checkout-payment-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.checkout-motion-card {
+	animation: checkout-fade-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+	animation-delay: var(--checkout-delay, 0ms);
+}
+
+.checkout-stage-card {
+	background: #fff;
+	border: 1px solid #e8eef1;
+	box-shadow: 0 14px 34px rgba(24, 39, 75, 0.06);
+}
+
+.checkout-stage-card--payment,
+.checkout-stage-card--billing {
+	padding: 22px 24px;
+	border-radius: 18px;
+}
+
+.checkout-panel-head {
+	display: flex;
+	align-items: flex-start;
+	gap: 12px;
+	margin-bottom: 14px;
+}
+
+.checkout-panel-head__icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 42px;
+	height: 42px;
+	border-radius: 12px;
+	background: #f3f6f7;
+	color: #095866;
+	flex-shrink: 0;
+}
+
+.checkout-panel-head__copy {
+	min-width: 0;
+}
+
+.checkout-panel-head__title {
+	font-size: 1.1875rem;
+	font-weight: 700;
+	line-height: 1.05;
+	color: #252b42;
+}
+
+.checkout-panel-head__text {
+	margin-top: 4px;
+	font-size: 0.84375rem;
+	line-height: 1.6;
+	color: #6b7280;
+}
+
+.checkout-payment-options-grid {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 10px;
+}
+
+.checkout-payment-option {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	min-height: 122px;
+	padding: 16px 10px;
+	border-radius: 16px;
+	border: 1px solid #ebedf0;
+	background: #fafafa;
+	text-align: center;
+	transition:
+		transform 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		box-shadow 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		border-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		background-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		color 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.checkout-payment-option:not(:disabled):hover {
+	transform: translateY(-2px);
+	border-color: #d7e5e8;
+	box-shadow: 0 12px 26px rgba(14, 42, 71, 0.08);
+}
+
+.checkout-payment-option--active {
+	border-color: #095866;
+	background: rgba(9, 88, 102, 0.04);
+	box-shadow: 0 2px 10px rgba(9, 88, 102, 0.12);
+}
+
+.checkout-payment-option--disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.checkout-payment-option__badge {
+	position: absolute;
+	top: -10px;
+	left: 12px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 24px;
+	padding: 0 10px;
+	border-radius: 999px;
+	background: #095866;
+	color: #fff;
+	font-size: 0.6875rem;
+	font-weight: 700;
+	line-height: 1;
+	box-shadow: 0 8px 18px rgba(9, 88, 102, 0.2);
+}
+
+.checkout-payment-option__icon-shell {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 40px;
+	height: 40px;
+	border-radius: 12px;
+	border: 1px solid #edf0f2;
+	background: #fff;
+	color: #7d8492;
+	transition:
+		background-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		border-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		box-shadow 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.checkout-payment-option--active .checkout-payment-option__icon-shell {
+	background: #095866;
+	border-color: transparent;
+	color: #fff;
+	box-shadow: 0 10px 18px rgba(9, 88, 102, 0.18);
+}
+
+.checkout-payment-option__copy {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.checkout-payment-option__title {
+	font-size: 0.9375rem;
+	font-weight: 700;
+	line-height: 1.25;
+	color: #252b42;
+}
+
+.checkout-payment-option__text {
+	font-size: 0.8125rem;
+	line-height: 1.45;
+	color: #7a8090;
+}
+
+.checkout-payment-notice {
+	margin-top: 18px;
+	padding: 14px 16px;
+	border-radius: 14px;
+	border: 1px solid #fde6b8;
+	background: #fff8e7;
+	font-size: 0.875rem;
+	line-height: 1.55;
+	color: #8f5b00;
+}
+
+.checkout-payment-panel {
+	margin-top: 14px;
+}
+
+.checkout-payment-choice-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.checkout-payment-choice {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	width: 100%;
+	padding: 14px 16px;
+	border-radius: 16px;
+	border: 1px solid #ebedf0;
+	background: #fff;
+	text-align: left;
+	transition:
+		transform 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		border-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		box-shadow 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		background-color 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.checkout-payment-choice:hover {
+	transform: translateY(-1px);
+	box-shadow: 0 10px 24px rgba(18, 35, 56, 0.06);
+}
+
+.checkout-payment-choice__header {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	width: 100%;
+}
+
+.checkout-payment-choice--expandable {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 0;
+	cursor: pointer;
+}
+
+.checkout-payment-choice--selected {
+	border-color: #095866;
+	background: rgba(9, 88, 102, 0.03);
+	box-shadow: 0 10px 24px rgba(9, 88, 102, 0.09);
+}
+
+.checkout-payment-choice__brand {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 48px;
+	height: 32px;
+	padding: 0 12px;
+	border-radius: 10px;
+	background: #252b42;
+	color: #fff;
+	font-size: 0.8125rem;
+	font-weight: 800;
+	letter-spacing: 0.04em;
+	flex-shrink: 0;
+}
+
+.checkout-payment-choice__icon-shell {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 36px;
+	height: 36px;
+	border-radius: 12px;
+	background: #f1f3f6;
+	color: #7a8090;
+	flex-shrink: 0;
+}
+
+.checkout-payment-choice__copy {
+	flex: 1;
+	min-width: 0;
+}
+
+.checkout-payment-choice__eyebrow {
+	font-size: 0.75rem;
+	font-weight: 700;
+	letter-spacing: 0.02em;
+	text-transform: uppercase;
+	color: #7a8090;
+}
+
+.checkout-payment-choice__title {
+	font-size: 1rem;
+	font-weight: 700;
+	line-height: 1.25;
+	color: #252b42;
+}
+
+.checkout-payment-choice__text {
+	margin-top: 4px;
+	font-size: 0.875rem;
+	line-height: 1.45;
+	color: #7a8090;
+}
+
+.checkout-payment-choice__radio {
+	position: relative;
+	display: inline-flex;
+	width: 24px;
+	height: 24px;
+	border-radius: 999px;
+	border: 1px solid #d9e0e4;
+	background: #fff;
+	flex-shrink: 0;
+}
+
+.checkout-payment-choice__radio::after {
+	content: '';
+	position: absolute;
+	inset: 5px;
+	border-radius: 999px;
+	background: #095866;
+	transform: scale(0);
+	transition: transform 0.24s ease;
+}
+
+.checkout-payment-choice__radio--selected::after {
+	transform: scale(1);
+}
+
+.checkout-payment-card-form {
+	margin-top: 12px;
+	padding: 16px;
+	border-radius: 16px;
+	border: 1px solid #e8eef1;
+	background: #fff;
+	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.checkout-payment-card-form--embedded {
+	margin-top: 12px;
+	padding: 12px 0 0;
+	border: 0;
+	border-top: 1px solid rgba(9, 88, 102, 0.12);
+	border-radius: 0;
+	background: transparent;
+	box-shadow: none;
+}
+
+.checkout-payment-card-form__head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	margin-bottom: 12px;
+}
+
+.checkout-payment-card-form__intro {
+	min-width: 0;
+}
+
+.checkout-payment-card-form__title {
+	font-size: 0.9375rem;
+	font-weight: 700;
+	color: #252b42;
+}
+
+.checkout-payment-card-form__text {
+	margin-top: 4px;
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	color: #7a8090;
+}
+
+.checkout-payment-card-form__save {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 0.8125rem;
+	line-height: 1.35;
+	color: #4e5869;
+	cursor: pointer;
+	margin-top: 12px;
+}
+
+.checkout-payment-card-form__checkbox {
+	width: 16px;
+	height: 16px;
+	accent-color: #095866;
+	cursor: pointer;
+}
+
+.checkout-payment-card-form__element {
+	min-height: 52px;
+	padding: 14px 12px;
+	border-radius: 14px;
+	border: 1px solid #d7e1e4;
+	background: #fff;
+}
+
+.checkout-payment-card-form__helper {
+	margin-top: 10px;
+	font-size: 0.75rem;
+	color: #7a8090;
+}
+
+.checkout-payment-card-form__error {
+	margin-top: 10px;
+	font-size: 0.75rem;
+	color: #dc2626;
+}
+
+.checkout-payment-alt {
+	padding: 4px 0 0;
+}
+
+.checkout-payment-alt__title {
+	font-size: 0.9375rem;
+	font-weight: 700;
+	color: #252b42;
+}
+
+.checkout-payment-alt__text {
+	margin-top: 6px;
+	font-size: 0.875rem;
+	line-height: 1.6;
+	color: #5c6676;
+}
+
+.checkout-payment-alt__error {
+	margin-top: 10px;
+	font-size: 0.875rem;
+	font-weight: 600;
+	color: #dc2626;
+}
+
+.checkout-payment-alt__success {
+	margin-top: 10px;
+	font-size: 0.875rem;
+	font-weight: 600;
+	color: #059669;
+}
+
+.checkout-billing-segment {
+	display: flex;
+	padding: 4px;
+	border-radius: 16px;
+	border: 1px solid #edf1f4;
+	background: #f7fafb;
+}
+
+.checkout-billing-segment--sub {
+	padding: 3px;
+	border-radius: 14px;
+	background: #fbfcfd;
+}
+
+.checkout-billing-pill-row,
+.checkout-billing-subpill-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	width: 100%;
+}
+
+.checkout-billing-subpill-row {
+	margin-top: 2px;
+}
+
+.checkout-billing-pill,
+.checkout-billing-subpill {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: 1 1 0;
+	min-height: 40px;
+	padding: 0 18px;
+	border-radius: 11px;
+	border: 1px solid #e9edf1;
+	background: #fff;
+	font-size: 0.9375rem;
+	font-weight: 600;
+	color: #4e5869;
+	cursor: pointer;
+	transition:
+		transform 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		border-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		background-color 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		box-shadow 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+		color 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.checkout-billing-pill:hover,
+.checkout-billing-subpill:hover {
+	transform: translateY(-1px);
+}
+
+.checkout-billing-pill--active {
+	border-color: #095866;
+	background: rgba(9, 88, 102, 0.04);
+	color: #095866;
+	box-shadow: 0 10px 20px rgba(9, 88, 102, 0.08);
+}
+
+.checkout-billing-pill--idle {
+	color: #596172;
+	background: #fff;
+}
+
+.checkout-billing-subpill {
+	min-height: 36px;
+	padding: 0 14px;
+	font-size: 0.875rem;
+	border-radius: 10px;
+}
+
+.checkout-billing-subpill--active {
+	border-color: #095866;
+	background: #095866;
+	color: #fff;
+	box-shadow: 0 10px 18px rgba(9, 88, 102, 0.16);
+}
+
+.checkout-billing-subpill--idle {
+	background: #fff;
+	color: #596172;
+}
+
+.checkout-billing-context-note {
+	padding: 12px 14px;
+	border-radius: 14px;
+	border: 1px solid #e8eef1;
+	background: #fbfcfd;
+}
+
+.checkout-billing-context-note__title {
+	font-size: 0.875rem;
+	font-weight: 700;
+	color: #252b42;
+}
+
+.checkout-billing-context-note__text {
+	margin-top: 4px;
+	font-size: 0.8125rem;
+	line-height: 1.55;
+	color: #667085;
+}
+
+.checkout-billing-context-note__prefill {
+	margin-top: 8px;
+	font-size: 0.8125rem;
+	line-height: 1.45;
+	font-weight: 600;
+	color: #095866;
+}
+
+.checkout-billing-reveal {
+	margin-top: 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.checkout-billing-fields {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.checkout-billing-grid {
+	display: grid;
+	gap: 10px;
+}
+
+.checkout-billing-grid--company-top {
+	grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.checkout-billing-grid--company-mid {
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.checkout-billing-grid--private-top {
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.checkout-billing-grid--address {
+	grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) 80px 100px;
+}
+
+.checkout-billing-label {
+	display: block;
+	margin-bottom: 4px;
+	font-size: 0.8125rem;
+	font-weight: 600;
+	color: #4e5869;
+}
+
+.checkout-billing-input {
+	width: 100%;
+	height: 46px;
+	padding: 0 14px;
+	border-radius: 12px;
+	border: 1px solid transparent;
+	background: #f8f9fa;
+	color: #252b42;
+	font-size: 0.9375rem;
+	transition:
+		border-color 0.25s ease,
+		box-shadow 0.25s ease,
+		background-color 0.25s ease;
+}
+
+.checkout-billing-input::placeholder {
+	color: #a0a5ab;
+}
+
+.checkout-billing-input:focus {
+	outline: none;
+	border-color: #095866;
+	box-shadow: inset 0 0 0 1px #095866;
+	background: #fff;
+}
+
+.checkout-billing-receipt-note {
+	margin-top: 14px;
+	padding: 12px 14px;
+	border-radius: 14px;
+	background: #f7f9fb;
+	color: #667085;
+	font-size: 0.875rem;
+	line-height: 1.55;
+}
+
+.checkout-payment-footer {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(292px, 340px);
+	grid-template-areas:
+		"summary submit"
+		"support submit";
+	align-items: start;
+	gap: 14px 18px;
+	padding: 18px 20px;
+	border-radius: 18px;
+	border: 1px solid #e5eaec;
+	background: #fff;
+	box-shadow: 0 14px 34px rgba(24, 39, 75, 0.06);
+}
+
+.checkout-payment-footer__summary {
+	grid-area: summary;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	min-height: 86px;
+	padding: 10px 12px;
+	border-radius: 14px;
+	background: linear-gradient(135deg, rgba(9, 88, 102, 0.06), rgba(228, 66, 3, 0.06));
+	border: 1px solid rgba(9, 88, 102, 0.08);
+}
+
+.checkout-payment-footer__summary-copy {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.checkout-payment-footer__summary-label {
+	font-size: 0.75rem;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: #6b7280;
+}
+
+.checkout-payment-footer__summary-value {
+	margin-top: 2px;
+	font-size: 1.3125rem;
+	font-weight: 800;
+	line-height: 1;
+	color: #252b42;
+}
+
+.checkout-payment-footer__summary-chip {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 28px;
+	padding: 0 10px;
+	border-radius: 999px;
+	background: rgba(255, 255, 255, 0.82);
+	border: 1px solid rgba(9, 88, 102, 0.1);
+	font-size: 0.75rem;
+	font-weight: 700;
+	color: #095866;
+	text-align: center;
+}
+
+.checkout-payment-footer__support {
+	grid-area: support;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 2px 2px 0;
+	max-width: 560px;
+}
+
+.checkout-payment-footer__terms {
+	display: inline-flex;
+	align-items: flex-start;
+	gap: 10px;
+	cursor: pointer;
+	color: #4b5563;
+	font-size: 0.875rem;
+	line-height: 1.55;
+}
+
+.checkout-payment-footer__checkbox {
+	margin-top: 2px;
+	width: 20px;
+	height: 20px;
+	min-width: 20px;
+	accent-color: #095866;
+	cursor: pointer;
+}
+
+.checkout-payment-footer__terms-link {
+	color: #095866;
+	font-weight: 600;
+}
+
+.checkout-payment-footer__hint {
+	font-size: 0.8125rem;
+	line-height: 1.5;
+	color: #6b7280;
+	max-width: 480px;
+	margin: 0;
+}
+
+.checkout-payment-submit {
+	grid-area: submit;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	min-height: 54px;
+	min-width: 240px;
+	padding: 0 20px;
+	border-radius: 999px;
+	font-size: 1rem;
+	font-weight: 700;
+	color: #fff;
+	align-self: start;
+	justify-self: stretch;
+	transition:
+		transform 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+		background-color 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+		box-shadow 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+		opacity 0.3s ease;
+}
+
+.checkout-payment-submit--active {
+	background: #e44203;
+	box-shadow: 0 16px 32px rgba(228, 66, 3, 0.22);
+}
+
+.checkout-payment-submit--active:hover {
+	transform: translateY(-1px);
+	box-shadow: 0 18px 36px rgba(228, 66, 3, 0.26);
+}
+
+.checkout-payment-submit--disabled {
+	background: #c8cdd5;
+	cursor: not-allowed;
+}
+
+.checkout-payment-status {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.checkout-payment-status__error,
+.checkout-payment-status__progress {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 14px;
+	border-radius: 16px;
+	font-size: 0.875rem;
+}
+
+.checkout-payment-status__error {
+	border: 1px solid #fecaca;
+	background: #fef2f2;
+	color: #dc2626;
+}
+
+.checkout-payment-status__progress {
+	border: 1px solid #bfdbfe;
+	background: #eff6ff;
+	color: #2563eb;
+	font-weight: 600;
+}
+
+@media (max-width: 1279px) {
+	.checkout-payment-options-grid {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.checkout-billing-grid--company-mid,
+	.checkout-billing-grid--private-top {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.checkout-billing-grid--company-top {
+		grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+	}
+
+	.checkout-billing-grid--company-top > :nth-child(3) {
+		grid-column: 1 / -1;
+	}
+
+	.checkout-billing-grid--address {
+		grid-template-columns: minmax(0, 1.7fr) minmax(0, 1.15fr) 88px 96px;
+	}
+
+	.checkout-payment-footer {
+		position: sticky;
+		bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+		z-index: 18;
+		align-items: start;
+	}
+}
+
+@media (max-width: 767px) {
+	.checkout-stage-card--payment,
+	.checkout-stage-card--billing {
+		padding: 18px 14px;
+		border-radius: 16px;
+	}
+
+	.checkout-panel-head {
+		align-items: center;
+		margin-bottom: 12px;
+		gap: 10px;
+	}
+
+	.checkout-panel-head__icon {
+		width: 38px;
+		height: 38px;
+		border-radius: 11px;
+	}
+
+	.checkout-panel-head__title {
+		font-size: 1.0625rem;
+	}
+
+	.checkout-panel-head__text {
+		font-size: 0.8rem;
+	}
+
+	.checkout-payment-options-grid {
+		grid-template-columns: 1fr;
+		gap: 8px;
+	}
+
+	.checkout-payment-option {
+		min-height: 108px;
+		padding: 14px 10px;
+	}
+
+	.checkout-payment-choice {
+		padding: 13px 14px;
+		border-radius: 14px;
+	}
+
+	.checkout-payment-card-form {
+		padding: 14px;
+	}
+
+	.checkout-payment-card-form__head {
+		margin-bottom: 8px;
+	}
+
+	.checkout-billing-grid--company-top,
+	.checkout-billing-grid--company-mid,
+	.checkout-billing-grid--private-top,
+	.checkout-billing-grid--address {
+		grid-template-columns: 1fr;
+	}
+
+	.checkout-billing-context-note {
+		padding: 11px 12px;
+	}
+
+	.checkout-payment-footer {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		padding: 14px 12px;
+		bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+	}
+
+	.checkout-payment-footer__summary {
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 8px;
+	}
+
+	.checkout-payment-footer__summary-chip {
+		align-self: flex-start;
+	}
+
+	.checkout-payment-footer__support {
+		padding: 0;
+	}
+
+	.checkout-payment-submit {
+		align-self: stretch;
+	}
+
+	.checkout-payment-footer__hint {
+		padding-left: 0;
+		max-width: none;
+	}
+
+	.checkout-payment-submit {
+		width: 100%;
+		min-width: 0;
+		align-self: stretch;
 	}
 }
 </style>

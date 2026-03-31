@@ -13,6 +13,11 @@ function T([string]$m,[string]$c="Cyan"){
   Write-Host "[$ts] $m" -ForegroundColor $c
 }
 
+function Get-LogTail([string]$path,[int]$lines=40){
+  if(-not (Test-Path $path)){ return "(log non disponibile: $path)" }
+  return ((Get-Content -Path $path -Tail $lines -ErrorAction SilentlyContinue) -join "`n")
+}
+
 function Read-KeyChoice([string]$prompt = "Scelta"){
   Write-Host -NoNewline ("${prompt}: ") -ForegroundColor Cyan
   $keyInfo = [System.Console]::ReadKey($true)
@@ -32,6 +37,13 @@ function Load-State(){
     try { return (Get-Content $state -Raw | ConvertFrom-Json) } catch { return $null }
   }
   return $null
+}
+
+function Get-OnlineUrl(){
+  if(-not (Test-Path $urlFile)){ return $null }
+  $u = (Get-Content $urlFile -Raw).Trim()
+  if([string]::IsNullOrWhiteSpace($u)){ return $null }
+  return $u
 }
 
 function Kill-PidTree([int]$procId){
@@ -72,6 +84,32 @@ function Wait-Http([string]$url,[int]$timeoutSec=240){
   return $false
 }
 
+function Wait-HttpOrFail([string]$url,[System.Diagnostics.Process]$process,[string]$label,[string]$logPath,[int]$timeoutSec=240){
+  $start = Get-Date
+  while((Get-Date) - $start -lt [TimeSpan]::FromSeconds($timeoutSec)){
+    try{
+      Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri $url | Out-Null
+      return $true
+    } catch {
+      try{ if($_.Exception.Response){ return $true } } catch {}
+    }
+
+    try{
+      if($process -and $process.HasExited){
+        $tail = Get-LogTail $logPath
+        throw "${label} terminato prima di rispondere. ExitCode=$($process.ExitCode)`nLog: $logPath`n$tail"
+      }
+    } catch {
+      throw
+    }
+
+    Start-Sleep -Milliseconds 400
+  }
+
+  $tail = Get-LogTail $logPath
+  throw "${label} non risponde su $url entro ${timeoutSec}s.`nLog: $logPath`n$tail"
+}
+
 function Resolve-ProjectDir([string]$preferredName, [string[]]$markerFiles, [string]$projectLabel){
   $preferred = Join-Path $root $preferredName
   foreach($marker in $markerFiles){
@@ -109,6 +147,36 @@ function Find-Backend(){
 function Has-Caddyfile(){ return (Test-Path (Join-Path $root "Caddyfile")) }
 function Has-Caddy(){ return [bool](Get-Command caddy -ErrorAction SilentlyContinue) }
 
+function Stop-StaleCloudflared(){
+  $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.Name -eq 'cloudflared.exe' -and
+      $_.CommandLine -match 'trycloudflare|127\.0\.0\.1:8787|127\.0\.0\.1:8000|3001|8000'
+    }
+
+  foreach($process in $processes){
+    try {
+      Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    } catch {}
+  }
+}
+
+function Test-OnlineUrl([string]$url){
+  if(-not $url){ return $false }
+
+  try {
+    $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Method Head -TimeoutSec 8 -ErrorAction Stop
+    return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400)
+  } catch {
+    try {
+      $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Method Get -TimeoutSec 8 -ErrorAction Stop
+      return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400)
+    } catch {
+      return $false
+    }
+  }
+}
+
 function Stop-All(){
   T "Chiusura totale (spedizionefacile)..." "Yellow"
   $s = Load-State
@@ -123,8 +191,10 @@ function Stop-All(){
   Kill-ByPort 8787
   Kill-ByPort 3001
   Kill-ByPort 8000
+  Stop-StaleCloudflared
 
   Remove-Item $state -Force -ErrorAction SilentlyContinue | Out-Null
+  Remove-Item $urlFile -Force -ErrorAction SilentlyContinue | Out-Null
   T "Tutto chiuso." "Green"
 }
 
@@ -143,6 +213,137 @@ function Ensure-NpmInstall([string]$dir){
     if($p.ExitCode -ne 0){ T "ERRORE npm install Nuxt. Log: $e" "Red"; throw "npm install Nuxt fallito" }
     T "npm install Nuxt completato." "Green"
   }
+
+  Ensure-NuxtWindowsOptionalDeps $dir
+}
+
+function Get-LockedPackageVersion([string]$lockPath,[string]$packageName){
+  if(-not (Test-Path $lockPath)){ return $null }
+
+  $content = Get-Content -Path $lockPath -Raw
+  $target = [regex]::Escape("node_modules/$packageName")
+  $pattern = '"' + $target + '"\s*:\s*\{[\s\S]*?"version"\s*:\s*"([^"]+)"'
+  $match = [regex]::Match($content, $pattern)
+  if($match.Success){ return $match.Groups[1].Value }
+  return $null
+}
+
+function Ensure-NuxtWindowsOptionalDeps([string]$dir){
+  $oxcBinding = Join-Path $dir "node_modules\@oxc-parser\binding-win32-x64-msvc\package.json"
+  $rollupBinding = Join-Path $dir "node_modules\@rollup\rollup-win32-x64-msvc\package.json"
+
+  if((Test-Path $oxcBinding) -and (Test-Path $rollupBinding)){ return }
+
+  T "Ripristino dipendenze opzionali Windows di Nuxt..." "Yellow"
+  $installOut = Join-Path $logDir "nuxt_optionaldeps_out.log"
+  $installErr = Join-Path $logDir "nuxt_optionaldeps_err.log"
+  Remove-Item $installOut,$installErr -Force -ErrorAction SilentlyContinue | Out-Null
+
+  $repair = Start-Process -FilePath "cmd.exe" -WorkingDirectory $dir -PassThru -WindowStyle Hidden `
+    -ArgumentList "/c","npm install --include=optional --no-audit" `
+    -RedirectStandardOutput $installOut -RedirectStandardError $installErr
+  $repair.WaitForExit()
+
+  if((Test-Path $oxcBinding) -and (Test-Path $rollupBinding)){
+    T "Dipendenze opzionali Windows Nuxt ripristinate." "Green"
+    return
+  }
+
+  $lockPath = Join-Path $dir "package-lock.json"
+  $oxcVersion = Get-LockedPackageVersion $lockPath "@oxc-parser/binding-win32-x64-msvc"
+  $rollupVersion = Get-LockedPackageVersion $lockPath "@rollup/rollup-win32-x64-msvc"
+  $packages = @()
+  if($oxcVersion){ $packages += "@oxc-parser/binding-win32-x64-msvc@$oxcVersion" }
+  if($rollupVersion){ $packages += "@rollup/rollup-win32-x64-msvc@$rollupVersion" }
+
+  if($packages.Count -gt 0){
+    T "Ripristino mirato binding nativi Windows..." "Yellow"
+    $cmd = "npm install --no-save --no-audit " + ($packages -join " ")
+    $repair = Start-Process -FilePath "cmd.exe" -WorkingDirectory $dir -PassThru -WindowStyle Hidden `
+      -ArgumentList "/c",$cmd `
+      -RedirectStandardOutput $installOut -RedirectStandardError $installErr
+    $repair.WaitForExit()
+  }
+
+  if(-not ((Test-Path $oxcBinding) -and (Test-Path $rollupBinding))){
+    $tail = Get-LogTail $installErr
+    throw "Nuxt non puo' partire su Windows: binding nativi mancanti.`nLog: $installErr`n$tail"
+  }
+
+  T "Dipendenze opzionali Windows Nuxt ripristinate." "Green"
+}
+
+function Reset-NuxtArtifactsForWindows([string]$dir){
+  $markers = @(
+    (Join-Path $dir ".nuxt\dist\server\server.mjs"),
+    (Join-Path $dir ".nuxt\dev\index.mjs"),
+    (Join-Path $dir ".nuxt\app.config.mjs"),
+    (Join-Path $dir ".nuxt\ui.css")
+  )
+
+  $workspaceDirs = @(
+    Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue |
+      Where-Object {
+        (Test-Path (Join-Path $_.FullName ".nuxt\dev\index.mjs")) -or
+        (Test-Path (Join-Path $_.FullName ".nuxt\dist\server\server.mjs")) -or
+        (Test-Path (Join-Path $_.FullName "node_modules\.cache\nuxt\chrome-workspace.json"))
+      }
+  )
+
+  $needsReset = $false
+  foreach($marker in $markers){
+    if(-not (Test-Path $marker)){ continue }
+    try{
+      $content = Get-Content -Path $marker -Raw -ErrorAction Stop
+      if(
+        $content -match 'file:///mnt/' -or
+        $content -match '/mnt/c/' -or
+        $content -match '@source "/mnt/'
+      ){
+        $needsReset = $true
+        break
+      }
+    } catch {}
+  }
+
+  if(-not $needsReset){
+    foreach($workspaceDir in $workspaceDirs){
+      $workspaceMarkers = @(
+        (Join-Path $workspaceDir.FullName ".nuxt\dist\server\server.mjs"),
+        (Join-Path $workspaceDir.FullName ".nuxt\dev\index.mjs"),
+        (Join-Path $workspaceDir.FullName ".nuxt\app.config.mjs")
+      )
+
+      foreach($workspaceMarker in $workspaceMarkers){
+        if(-not (Test-Path $workspaceMarker)){ continue }
+        try{
+          $content = Get-Content -Path $workspaceMarker -Raw -ErrorAction Stop
+          if($content -match 'file:///mnt/' -or $content -match '/mnt/c/' -or $content -match '@source "/mnt/'){
+            $needsReset = $true
+            break
+          }
+        } catch {}
+      }
+
+      if($needsReset){ break }
+    }
+  }
+
+  if((-not $needsReset) -and ($workspaceDirs.Count -eq 0)){ return }
+
+  T "Artefatti Nuxt generati da WSL rilevati: pulizia cache Nuxt/host workspace per rigenerazione Windows..." "Yellow"
+  foreach($relative in @(".nuxt", ".output")){
+    $target = Join-Path $dir $relative
+    if(Test-Path $target){
+      Remove-Item -Path $target -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  foreach($workspaceDir in $workspaceDirs){
+    if(Test-Path $workspaceDir.FullName){
+      Remove-Item -Path $workspaceDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 
@@ -158,7 +359,7 @@ function Set-Or-AddEnvKey([string]$envPath,[string]$key,[string]$value){
   Set-Content -Path $envPath -Value $content -NoNewline
 }
 
-function Normalize-LaravelEnv([string]$backDir){
+function Normalize-LaravelEnv([string]$backDir,[string]$frontendUrl){
   $envFile = Join-Path $backDir '.env'
   $envExample = Join-Path $backDir '.env.example'
   if(-not (Test-Path $envFile) -and (Test-Path $envExample)){
@@ -173,7 +374,9 @@ function Normalize-LaravelEnv([string]$backDir){
   Set-Or-AddEnvKey $envFile 'SESSION_DRIVER' 'file'
   Set-Or-AddEnvKey $envFile 'QUEUE_CONNECTION' 'sync'
   Set-Or-AddEnvKey $envFile 'CACHE_STORE' 'file'
-  Set-Or-AddEnvKey $envFile 'APP_FRONTEND_URL' 'http://127.0.0.1:8787'
+  Set-Or-AddEnvKey $envFile 'SANCTUM_STATEFUL_DOMAINS' '127.0.0.1:8787,localhost:8787,127.0.0.1:3001,localhost:3001,127.0.0.1:8000,localhost:8000,*.trycloudflare.com'
+  Set-Or-AddEnvKey $envFile 'CORS_ALLOWED_ORIGINS' 'http://127.0.0.1:8787,http://localhost:8787,http://127.0.0.1:3001,http://localhost:3001,http://127.0.0.1:8000,http://localhost:8000'
+  Set-Or-AddEnvKey $envFile 'APP_FRONTEND_URL' $frontendUrl
 
   if(Test-Path (Join-Path $backDir 'artisan')){
     $keyOut = Join-Path $logDir 'keygen_out.log'
@@ -190,6 +393,11 @@ function Normalize-LaravelEnv([string]$backDir){
     $seedErr = Join-Path $logDir 'seed_err.log'
     Start-Process -FilePath 'cmd.exe' -WorkingDirectory $backDir -WindowStyle Hidden -Wait `
       -ArgumentList '/c','php artisan db:seed --class=Database\Seeders\DatabaseSeeder --force' -RedirectStandardOutput $seedOut -RedirectStandardError $seedErr | Out-Null
+
+    $locationsOut = Join-Path $logDir 'locations_import_out.log'
+    $locationsErr = Join-Path $logDir 'locations_import_err.log'
+    Start-Process -FilePath 'cmd.exe' -WorkingDirectory $backDir -WindowStyle Hidden -Wait `
+      -ArgumentList '/c','php artisan locations:import --if-empty --country=IT' -RedirectStandardOutput $locationsOut -RedirectStandardError $locationsErr | Out-Null
 
     # Crea il symlink storage per rendere accessibili le immagini caricate (es. homepage)
     $storageLink = Join-Path $backDir 'public\storage'
@@ -224,7 +432,7 @@ function Ensure-ComposerInstall([string]$dir){
   }
 }
 
-function Start-Local([switch]$NonAprireBrowser){
+function Start-Local([switch]$NonAprireBrowser, [ValidateSet('dev','preview')][string]$FrontendMode = 'dev'){
   Stop-All
 
   $frontDir = Find-Frontend
@@ -237,10 +445,14 @@ function Start-Local([switch]$NonAprireBrowser){
   $frontPort = 3001
   $backPort  = 8000
   $proxyPort = 8787
+  $useCaddy = (Has-Caddyfile) -and (Has-Caddy)
+  $apiBase = if($useCaddy){ "http://127.0.0.1:$proxyPort" } else { "http://127.0.0.1:$backPort" }
+  $frontendUrl = if($useCaddy){ "http://127.0.0.1:$proxyPort" } else { "http://127.0.0.1:$frontPort" }
 
   Ensure-NpmInstall $frontDir
+  Reset-NuxtArtifactsForWindows $frontDir
   Ensure-ComposerInstall $backDir
-  Normalize-LaravelEnv $backDir
+  Normalize-LaravelEnv $backDir $frontendUrl
 
   # log
   $nuxtOut  = Join-Path $logDir "nuxt_out.log"
@@ -259,9 +471,15 @@ function Start-Local([switch]$NonAprireBrowser){
     -RedirectStandardOutput $phpOut -RedirectStandardError $phpErr
 
   # Avvio Nuxt
-  T "Avvio Nuxt: http://127.0.0.1:$frontPort" "Cyan"
+  $nuxtCommand = if($FrontendMode -eq 'preview'){
+    "set ""NUXT_PUBLIC_API_BASE=$apiBase"" && set ""NUXT_PUBLIC_SANCTUM_BASE_URL=$apiBase"" && set ""NODE_OPTIONS=--max-old-space-size=6144"" && npx nuxi prepare && npm run build && set ""PORT=$frontPort"" && set ""NITRO_PORT=$frontPort"" && set ""HOST=127.0.0.1"" && set ""NITRO_HOST=127.0.0.1"" && node .output\server\index.mjs"
+  } else {
+    "set ""NUXT_PUBLIC_API_BASE=$apiBase"" && set ""NUXT_PUBLIC_SANCTUM_BASE_URL=$apiBase"" && set ""NODE_OPTIONS=--max-old-space-size=6144"" && npm run dev -- --host 127.0.0.1 --port $frontPort"
+  }
+
+  T "Avvio Nuxt ($FrontendMode): http://127.0.0.1:$frontPort" "Cyan"
   $pFront = Start-Process -FilePath "cmd.exe" -WorkingDirectory $frontDir -PassThru -WindowStyle Hidden `
-    -ArgumentList "/c","npx nuxi dev --host 127.0.0.1 --port $frontPort" `
+    -ArgumentList "/c",$nuxtCommand `
     -RedirectStandardOutput $nuxtOut -RedirectStandardError $nuxtErr
 
   # Avvio Caddy se possibile
@@ -288,6 +506,7 @@ function Start-Local([switch]$NonAprireBrowser){
     backend    = $pBack.Id
     caddy      = $pCaddy
     cloudflared= 0
+    frontendMode = $FrontendMode
     frontPort  = $frontPort
     backPort   = $backPort
     proxyPort  = $proxyPort
@@ -296,10 +515,10 @@ function Start-Local([switch]$NonAprireBrowser){
 
   # attese: prima Nuxt e Laravel, poi base finale
   T "Attendere avvio Nuxt..." "DarkCyan"
-  [void](Wait-Http ("http://127.0.0.1:$frontPort") 240)
+  [void](Wait-HttpOrFail ("http://127.0.0.1:$frontPort") $pFront "Nuxt" $nuxtErr 240)
 
   T "Attendere avvio Laravel..." "DarkCyan"
-  [void](Wait-Http ("http://127.0.0.1:$backPort") 240)
+  [void](Wait-HttpOrFail ("http://127.0.0.1:$backPort") $pBack "Laravel" $phpErr 240)
 
   T "Attendere avvio base finale..." "DarkCyan"
   if(-not (Wait-Http $base 240)){
@@ -307,7 +526,7 @@ function Start-Local([switch]$NonAprireBrowser){
     throw "Base non risponde"
   }
 
-  T "PRONTO (locale): $base" "Green"
+  T "PRONTO (locale/$FrontendMode): $base" "Green"
   if(-not $NonAprireBrowser){ Start-Process $base | Out-Null }
 }
 
@@ -324,69 +543,34 @@ function Get-CloudflaredPath(){
 }
 
 function Share-Online(){
-  Start-Local -NonAprireBrowser
-
-  $s = Load-State
-  $base = $s.base
-  if(-not $base){ $base = "http://127.0.0.1:8787" }
-
-  $cf = Get-CloudflaredPath
-
-  $out = Join-Path $logDir "cloudflared_out.log"
-  $err = Join-Path $logDir "cloudflared_err.log"
-  Remove-Item $out,$err -Force -ErrorAction SilentlyContinue | Out-Null
-
-  # Quick Tunnel Cloudflare (trycloudflare)
-  $cfDir = Join-Path $env:USERPROFILE ".cloudflared"
-  $bak = @()
-  try{
-    foreach($name in @("config.yml","config.yaml")){
-      $p = Join-Path $cfDir $name
-      if(Test-Path $p){
-        $b = "$p.bak_" + (Get-Date).ToString("yyyyMMdd_HHmmss")
-        Move-Item $p $b -Force
-        $bak += @(@($p,$b))
-      }
-    }
-
-    T "Avvio link pubblico (Cloudflare) verso $base" "Cyan"
-    $pTun = Start-Process -FilePath $cf -WorkingDirectory $root -PassThru -WindowStyle Hidden `
-      -ArgumentList @("tunnel","--url",$base) `
-      -RedirectStandardOutput $out -RedirectStandardError $err
-
-    $s.cloudflared = $pTun.Id
-    Save-State $s
-
-    $pattern = 'https://[^\s"]+\.trycloudflare\.com'
-    $pub = $null
-    $start = Get-Date
-    while(-not $pub -and ((Get-Date)-$start).TotalSeconds -lt 120){
-      $txt = ""
-      if(Test-Path $out){ $txt += (Get-Content $out -Raw) }
-      if(Test-Path $err){ $txt += "`n" + (Get-Content $err -Raw) }
-      if($txt -match $pattern){ $pub = $matches[0] }
-      Start-Sleep -Milliseconds 400
-    }
-    if(-not $pub){
-      T "ERRORE: non trovo il link pubblico. Vedi log cloudflared." "Red"
-      throw "Link pubblico non trovato"
-    }
-
-    $enc = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($urlFile, $pub, $enc)
-
-    T "PRONTO (online): $pub" "Green"
-    T "Link salvato in: $urlFile" "DarkGreen"
-
-    [void](Wait-Http $pub 120)
-    Start-Process $pub | Out-Null
-
-  } finally {
-    foreach($pair in $bak){
-      $orig = $pair[0]; $backup = $pair[1]
-      if(Test-Path $backup){ Move-Item $backup $orig -Force }
-    }
+  $existingOnline = Get-OnlineUrl
+  if($existingOnline -and (Test-OnlineUrl $existingOnline)){
+    T "Link pubblico gia' attivo: $existingOnline" "Green"
+    Start-Process $existingOnline | Out-Null
+    return
   }
+
+  $shareScript = Join-Path $root "scripts\avvia-cloudflare.ps1"
+  if(-not (Test-Path $shareScript)){
+    throw "Script condividi online non trovato: $shareScript"
+  }
+
+  T "Avvio link pubblico con script coordinato..." "Cyan"
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $shareScript
+
+  $pub = Get-OnlineUrl
+  if(-not $pub){
+    throw "URL_ONLINE.txt non aggiornato dopo avvio condividi online."
+  }
+
+  if(-not (Test-OnlineUrl $pub)){
+    T "ERRORE: il link pubblico non risponde: $pub" "Red"
+    throw "Link pubblico non raggiungibile"
+  }
+
+  T "PRONTO (online): $pub" "Green"
+  T "Link salvato in: $urlFile" "DarkGreen"
+  Start-Process $pub | Out-Null
 }
 
 function Open-Local(){
@@ -397,9 +581,16 @@ function Open-Local(){
 }
 
 function Open-Online(){
-  if(Test-Path $urlFile){
-    $u = (Get-Content $urlFile -Raw).Trim()
-    if($u){ Start-Process $u | Out-Null; return }
+  $u = Get-OnlineUrl
+  if($u){
+    if(Test-OnlineUrl $u){
+      Start-Process $u | Out-Null
+      return
+    }
+
+    Remove-Item $urlFile -Force -ErrorAction SilentlyContinue | Out-Null
+    T "Link online non piu raggiungibile. Rifai 'Condividi online'." "Yellow"
+    return
   }
   T "Non trovo URL_ONLINE.txt (prima fare 'Condividi online')." "Yellow"
 }
@@ -448,9 +639,13 @@ function Show-Status(){
   if($s -and $s.base){ $base = $s.base }
   Write-Host "Locale : $base" -ForegroundColor Cyan
 
-  if(Test-Path $urlFile){
-    $u = (Get-Content $urlFile -Raw).Trim()
-    if($u){ Write-Host "Online : $u" -ForegroundColor Green }
+  $u = Get-OnlineUrl
+  if($u){
+    if(Test-OnlineUrl $u){
+      Write-Host "Online : $u" -ForegroundColor Green
+    } else {
+      Write-Host "Online : $u (non raggiungibile)" -ForegroundColor Yellow
+    }
   } else {
     Write-Host "Online : (non attivo)" -ForegroundColor DarkGray
   }

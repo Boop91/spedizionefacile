@@ -23,6 +23,9 @@ Desktop.ini
 
 # Git worktrees
 .worktrees/
+.claude/
+.codex/
+.playwright-mcp/
 
 *.swp
 *.swo
@@ -42,6 +45,18 @@ laravel-spedizionefacile-main/database/database.sqlite
 
 # Captured emails (local SMTP)
 emails/
+
+# Local reports and artifacts
+output/
+tmp-diagnostica/
+reports/runtime/
+hero-*.png
+cloudflare-preview-*.txt
+_tmp_php_output.txt
+
+# Frontend local test artifacts
+nuxt-spedizionefacile-master/playwright-report/
+nuxt-spedizionefacile-master/test-results/
 
 # Backup files
 *.BAK_*

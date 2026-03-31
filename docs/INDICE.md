@@ -1,58 +1,76 @@
-# Documentazione SpediamoFacile
+# Documentazione Canonica SpediamoFacile
 
-Benvenuto nella documentazione completa del progetto SpediamoFacile.
-Questa guida copre tutto: dalla panoramica del progetto fino ai dettagli tecnici.
+Questo e' l'unico indice da aprire per orientarsi senza perdersi.
 
----
-
-## Tutorial - Imparare passo dopo passo
-
-Parti da qui se sei nuovo al progetto.
-
-1. [Panoramica del progetto](tutorial/01-PANORAMICA.md) - Cos'e' SpediamoFacile e come e' strutturato
-2. [Primo avvio](tutorial/02-PRIMO-AVVIO.md) - Come configurare il progetto da zero
-3. [Struttura del progetto](tutorial/03-STRUTTURA-PROGETTO.md) - Dove si trovano le cose: cartelle, file, convenzioni
-4. [Primo cambiamento](tutorial/04-PRIMO-CAMBIAMENTO.md) - Aggiungere un campo al profilo utente
-5. [Secondo cambiamento](tutorial/05-SECONDO-CAMBIAMENTO.md) - Aggiungere un nuovo servizio/accessorio alla spedizione
-6. [Terzo cambiamento](tutorial/06-TERZO-CAMBIAMENTO.md) - Modificare il flusso di checkout e pagamento
+Obiettivo: ridurre il rumore e lasciare un percorso leggibile anche per chi entra oggi nel progetto.
 
 ---
 
-## Guide operative - Come fare le cose
+## Parti da qui
 
-Istruzioni pratiche per le attivita' piu' comuni.
+Se hai poco tempo, apri questi documenti in questo ordine:
 
-- [Aggiungere un campo](guide/AGGIUNGERE-CAMPO.md) - Come aggiungere un campo a qualsiasi modello
-- [Aggiungere un servizio](guide/AGGIUNGERE-SERVIZIO.md) - Come aggiungere un nuovo servizio di spedizione
-- [Aggiungere una pagina](guide/AGGIUNGERE-PAGINA.md) - Come aggiungere una nuova pagina al frontend
-- [Modificare regole prezzo](guide/MODIFICARE-REGOLA-PREZZO.md) - Come cambiare le regole di calcolo prezzo
-- [Configurare BRT](guide/CONFIGURARE-BRT.md) - Come configurare le credenziali e i servizi BRT
-- [Configurare email](guide/CONFIGURARE-EMAIL.md) - Come configurare l'invio email (Resend, Gmail, log)
-- [Configurare Stripe](guide/CONFIGURARE-STRIPE.md) - Come configurare i pagamenti Stripe
-- [Gestire stati ordine](guide/GESTIRE-STATI-ORDINE.md) - Flusso degli stati ordine e come modificarlo
-- [Debugging](guide/DEBUGGING.md) - Errori comuni e come risolverli
+1. [README](../README.md) - come avviare il progetto e quali sono gli ingressi canonici
+2. [Kit onboarding](impara/KIT-ONBOARDING.md) - ingresso umano al repo e ai flussi veri
+3. [Audit master](architettura/AUDIT-MASTER.md) - stato reale del sistema e rischi principali
+4. [Standard progetto](architettura/STANDARD-PROGETTO.md) - regole di struttura e qualita'
+5. [Roadmap refactor](architettura/ROADMAP-REFACTOR.md) - piano operativo vivo
 
----
+Con questi 5 documenti una persona nuova capisce gia':
 
-## Riferimento tecnico - Dettagli completi
-
-Documentazione di riferimento per quando serve il dettaglio preciso.
-
-- [Stati ordine](riferimento/STATI-ORDINE.md) - Lista completa degli stati con transizioni
-- [Eventi e listeners](riferimento/EVENTI-LISTENERS.md) - Tutti gli eventi e i loro effetti
-- [API Endpoints](riferimento/API-ENDPOINTS.md) - Lista completa delle rotte API
-- [Modelli e database](riferimento/MODELLI-DATABASE.md) - Tutti i modelli con campi e relazioni
-- [Errori BRT](riferimento/ERRORI-BRT.md) - Codici errore BRT con significato e soluzioni
-- [Variabili ambiente](riferimento/VARIABILI-AMBIENTE.md) - Tutte le variabili .env con descrizione
+- come si avvia il progetto;
+- dove stanno frontend e backend;
+- quali sono i flussi core;
+- quali sono i punti ancora delicati.
 
 ---
 
-## Spiegazioni - Perche' le cose sono fatte cosi'
+## Documenti canonici da usare davvero
 
-Per capire le motivazioni dietro le scelte tecniche.
+- [Audit master](architettura/AUDIT-MASTER.md)
+- [Roadmap refactor](architettura/ROADMAP-REFACTOR.md)
+- [Standard progetto](architettura/STANDARD-PROGETTO.md)
+- [Root allowlist](architettura/ROOT-ALLOWLIST.md)
+- [Root classificazione](architettura/ROOT-CLASSIFICAZIONE.md)
+- [Dead code ledger](architettura/DEAD-CODE-LEDGER.md)
+- [Stato documenti](architettura/STATO-DOCUMENTI.md)
 
-- [Perche' questa architettura](spiegazioni/PERCHE-QUESTA-ARCHITETTURA.md) - Perche' Laravel + Nuxt
-- [Perche' sessioni](spiegazioni/PERCHE-SESSIONI.md) - Perche' il preventivo usa le sessioni
-- [Perche' normalizzazione BRT](spiegazioni/PERCHE-BRT-NORMALIZZAZIONE.md) - Perche' serve normalizzare gli indirizzi
-- [Perche' il portafoglio](spiegazioni/PERCHE-PORTAFOGLIO.md) - Perche' esiste un sistema portafoglio
-- [Decisioni tecniche](spiegazioni/DECISIONI-TECNICHE.md) - Le scelte tecniche principali e le loro ragioni
+Questi sono la sorgente di verita' della documentazione operativa.
+
+---
+
+## Manuali operativi
+
+Aprili solo quando ti serve una procedura specifica:
+
+- [Configurare Stripe](guide/CONFIGURARE-STRIPE.md)
+- [Configurare BRT](guide/CONFIGURARE-BRT.md)
+- [Configurare email](guide/CONFIGURARE-EMAIL.md)
+- [Debugging](guide/DEBUGGING.md)
+- [PUDO fallback operativo](riferimento/operativo/PUDO_FALLBACK_SETUP.md)
+
+---
+
+## Riferimento tecnico
+
+Usa questi documenti solo quando ti serve il dato preciso:
+
+- [API endpoints](riferimento/API-ENDPOINTS.md)
+- [Eventi e listeners](riferimento/EVENTI-LISTENERS.md)
+- [Stati ordine](riferimento/STATI-ORDINE.md)
+- [Modelli database](riferimento/MODELLI-DATABASE.md)
+- [Variabili ambiente](riferimento/VARIABILI-AMBIENTE.md)
+- [Errori BRT](riferimento/ERRORI-BRT.md)
+
+---
+
+## Materiale secondario
+
+Le cartelle seguenti restano disponibili, ma non sono piu' il percorso principale di lettura:
+
+- `docs/tutorial/`
+- `docs/impara/`
+- `docs/spiegazioni/`
+- `docs/GLOSSARIO-SEMPLICE.md`
+
+Servono per approfondire o studiare, non come documentazione canonica quotidiana.
