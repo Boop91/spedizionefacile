@@ -357,13 +357,14 @@ class StripeController extends Controller
         $stripe = new StripeClient($this->getStripeSecret());
 
         // Creiamo il pagamento su Stripe con conferma immediata
+        // off_session is false because the customer is present on the checkout page
+        // and can complete 3D Secure authentication if required
         $paymentIntent = $stripe->paymentIntents->create([
             'amount' => $order->subtotal->amount(), // Importo in centesimi
             'currency' => (string) $request->currency,
             'customer' => (string) $request->customer_id,
             'payment_method' => (string) $request->payment_method_id,
             'confirm' => true,           // Conferma subito il pagamento
-            'off_session' => true,       // Non richiede interazione dell'utente
             'metadata' => ['order_id' => (string) $order->id],
         ]);
 
@@ -372,10 +373,17 @@ class StripeController extends Controller
         $order->stripe_payment_intent_id = $paymentIntent->id;
         $order->save();
 
-        return response()->json([
+        $response = [
             'payment_intent_id' => $paymentIntent->id,
             'status' => $paymentIntent->status,
-        ]);
+        ];
+
+        // Include client_secret when 3D Secure authentication is required
+        if ($paymentIntent->status === 'requires_action') {
+            $response['client_secret'] = $paymentIntent->client_secret;
+        }
+
+        return response()->json($response);
     }
 
     // Crea un "PaymentIntent" (intenzione di pagamento) per il checkout con carta

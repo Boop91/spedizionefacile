@@ -672,8 +672,57 @@ export function useCheckout() {
 						});
 						return true;
 					} else if (payResult.status === "requires_action") {
-						paymentError.value = "La tua banca richiede autenticazione 3D Secure. Usa una nuova carta per completare l'autenticazione.";
-						return false;
+						// 3D Secure authentication required — handle client-side
+						paymentStep.value = 'Autenticazione 3D Secure...';
+						const { error: actionError, paymentIntent: updatedPI } =
+							await stripe.handleCardAction(payResult.client_secret);
+
+						if (actionError) {
+							paymentError.value = "Autenticazione 3D Secure fallita: " + actionError.message;
+							return false;
+						}
+
+						if (updatedPI.status === "succeeded") {
+							const paidEndpoint = isExisting ? '/api/stripe/existing-order-paid' : '/api/stripe/order-paid';
+							await sanctum(paidEndpoint, {
+								method: "POST",
+								body: {
+									order_id: orderId,
+									ext_id: updatedPI.id,
+									is_existing_order: isExisting,
+								},
+							});
+							return true;
+						} else if (updatedPI.status === "requires_confirmation") {
+							// After 3DS, server needs to confirm the payment
+							const confirmResult = await sanctum(payEndpoint, {
+								method: "POST",
+								body: {
+									order_id: orderId,
+									currency: "eur",
+									customer_id: user.value.customer_id,
+									payment_method_id: defaultPayment.value.card.id,
+									payment_intent_id: updatedPI.id,
+								},
+							});
+							if (confirmResult.status === "succeeded") {
+								const paidEndpoint = isExisting ? '/api/stripe/existing-order-paid' : '/api/stripe/order-paid';
+								await sanctum(paidEndpoint, {
+									method: "POST",
+									body: {
+										order_id: orderId,
+										ext_id: confirmResult.payment_intent_id || updatedPI.id,
+										is_existing_order: isExisting,
+									},
+								});
+								return true;
+							}
+							paymentError.value = "Pagamento non completato dopo autenticazione 3D Secure.";
+							return false;
+						} else {
+							paymentError.value = "Autenticazione 3D Secure non completata. Stato: " + updatedPI.status;
+							return false;
+						}
 					} else {
 						paymentError.value = "Pagamento non riuscito. Stato: " + payResult.status;
 						return false;
@@ -719,12 +768,13 @@ export function useCheckout() {
 						return false;
 					}
 
-					if (paymentIntent.status === "succeeded") {
-						if (saveCardForFuture.value && paymentIntent.payment_method) {
+					// Helper to finalize a succeeded payment intent
+					const finalizeSucceededPI = async (pi) => {
+						if (saveCardForFuture.value && pi.payment_method) {
 							try {
 								await sanctum('/api/stripe/set-default-payment-method', {
 									method: 'POST',
-									body: { payment_method: paymentIntent.payment_method },
+									body: { payment_method: pi.payment_method },
 								});
 								await refreshNuxtData('/api/stripe/default-payment-method');
 							} catch (saveErr) {
@@ -737,14 +787,33 @@ export function useCheckout() {
 							method: "POST",
 							body: {
 								order_id: orderId,
-								ext_id: paymentIntent.id,
+								ext_id: pi.id,
 								is_existing_order: isExisting,
 							},
 						});
+					};
+
+					if (paymentIntent.status === "succeeded") {
+						await finalizeSucceededPI(paymentIntent);
 						return true;
 					} else if (paymentIntent.status === "requires_action") {
-						paymentError.value = "Autenticazione 3D Secure richiesta ma non completata.";
-						return false;
+						// 3D Secure authentication required after confirmCardPayment
+						paymentStep.value = 'Autenticazione 3D Secure...';
+						const { error: actionError, paymentIntent: confirmedPI } =
+							await stripe.handleCardAction(piResponse.client_secret);
+
+						if (actionError) {
+							paymentError.value = "Autenticazione 3D Secure fallita: " + actionError.message;
+							return false;
+						}
+
+						if (confirmedPI.status === "succeeded") {
+							await finalizeSucceededPI(confirmedPI);
+							return true;
+						} else {
+							paymentError.value = "Autenticazione 3D Secure non completata. Stato: " + confirmedPI.status;
+							return false;
+						}
 					} else if (paymentIntent.status === "processing") {
 						paymentError.value = "Pagamento in elaborazione. Controlla lo stato tra qualche minuto.";
 						return false;
