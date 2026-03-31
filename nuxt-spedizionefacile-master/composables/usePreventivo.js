@@ -16,9 +16,17 @@ export const usePreventivo = async () => {
 
 	const formRef = ref(null);
 
-	// Carica fasce prezzo dinamiche dall'API (con fallback hardcoded)
+	// Dichiariamo autoQuoteTimer PRIMA dell'await per poter registrare
+	// onBeforeUnmount prima della prima sospensione asincrona (requisito Vue 3)
+	let autoQuoteTimer = null;
+	onBeforeUnmount(() => {
+		if (autoQuoteTimer) {
+			clearTimeout(autoQuoteTimer);
+		}
+	});
+
+	// Prepara fasce prezzo (le funzioni usano fallback hardcoded fino al caricamento API)
 	const { loadPriceBands, getWeightPrice, getVolumePrice, getCapSupplement, getEuropeQuote, priceBands, promoSettings } = usePriceBands();
-	await loadPriceBands();
 
 	const sanctum = useSanctumClient();
 	const locationSearch = useLocationSearch(sanctum);
@@ -130,7 +138,6 @@ export const usePreventivo = async () => {
 	const isSyncingQuote = ref(false);
 	const isAdvancingToServices = ref(false);
 	const lastQuotedSignature = ref("");
-	let autoQuoteTimer = null;
 	let pendingQuotePromise = null;
 	let pendingQuoteSignature = "";
 	let pendingQuoteSilent = false;
@@ -791,11 +798,9 @@ export const usePreventivo = async () => {
 		ensurePrimaryPackage();
 	};
 
-	onBeforeUnmount(() => {
-		if (autoQuoteTimer) {
-			clearTimeout(autoQuoteTimer);
-		}
-	});
+	// Carica fasce prezzo dall'API (DOPO la registrazione di tutti i lifecycle hooks)
+	// Le funzioni di calcolo usano fallback hardcoded nel frattempo
+	await loadPriceBands();
 
 	return {
 		// Refs

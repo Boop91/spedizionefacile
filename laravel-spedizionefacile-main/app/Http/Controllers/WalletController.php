@@ -37,6 +37,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Setting;
+use App\Models\User;
 use App\Models\WalletMovement;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -193,10 +194,10 @@ class WalletController extends Controller
 
         // Transazione con lock pessimistico per evitare double-spend da richieste concorrenti
         $result = DB::transaction(function () use ($user, $data) {
-            // Lock sugli ultimi movimenti dell'utente per serializzare gli accessi concorrenti
-            WalletMovement::where('user_id', $user->id)->lockForUpdate()->first();
+            // Lock sull'utente stesso per serializzare tutti gli accessi al portafoglio
+            $lockedUser = User::where('id', $user->id)->lockForUpdate()->first();
 
-            $balance = $user->walletBalance();
+            $balance = $lockedUser->walletBalance();
 
             if ($balance < $data['amount']) {
                 return ['error' => 'Saldo insufficiente. Disponibile: '.number_format($balance, 2).' EUR'];

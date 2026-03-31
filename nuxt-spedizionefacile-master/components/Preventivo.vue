@@ -61,7 +61,7 @@ const {
   sv, onWeightInput, onWeightBlur, onDimInput, onDimBlur,
   promoSettings,
   continueToNextStep, resetForm,
-} = usePreventivo();
+} = await usePreventivo();
 </script>
 
 <template>
