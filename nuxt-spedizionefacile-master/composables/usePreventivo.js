@@ -677,18 +677,40 @@ export const usePreventivo = () => {
 				isValid = await calculateRate({ silent: false, payload: payloadSnapshot });
 			}
 
-			if (!isValid) return;
-
-			const refreshedSession = await refresh().catch(() => session.value);
-			const refreshedData = refreshedSession?.data || refreshedSession || null;
-
-			if (refreshedData) {
-				syncQuoteStateFromSession(refreshedData, { sourceSignature: payloadSignature });
-			} else {
+			if (!isValid) {
+				// Check if failure was a local validation error (user input incomplete)
+				// or just an API/network failure (local state is valid)
+				const packagesReady = Array.isArray(userStore.packages)
+					&& userStore.packages.length > 0
+					&& userStore.packages.every(p =>
+						p.single_price != null
+						&& p.weight
+						&& p.first_size
+						&& p.second_size
+						&& p.third_size,
+					);
+				const locationsReady = Boolean(
+					String(userStore.shipmentDetails?.origin_city || '').trim()
+					&& String(userStore.shipmentDetails?.destination_city || '').trim()
+					&& (userStore.shipmentDetails?.origin_country_code !== 'IT' || String(userStore.shipmentDetails?.origin_postal_code || '').trim())
+					&& (userStore.shipmentDetails?.destination_country_code !== 'IT' || String(userStore.shipmentDetails?.destination_postal_code || '').trim()),
+				);
+				if (!(packagesReady && locationsReady)) return;
+				// API failed but local state is valid — sync from local snapshot and proceed
 				syncQuoteStateFromSession(payloadSnapshot, { sourceSignature: payloadSignature });
-			}
+				lastQuotedSignature.value = payloadSignature;
+			} else {
+				const refreshedSession = await refresh().catch(() => session.value);
+				const refreshedData = refreshedSession?.data || refreshedSession || null;
 
-			lastQuotedSignature.value = payloadSignature;
+				if (refreshedData) {
+					syncQuoteStateFromSession(refreshedData, { sourceSignature: payloadSignature });
+				} else {
+					syncQuoteStateFromSession(payloadSnapshot, { sourceSignature: payloadSignature });
+				}
+
+				lastQuotedSignature.value = payloadSignature;
+			}
 			await nextTick();
 			await navigateTo('/la-tua-spedizione/2', { replace: true });
 			userStore.stepNumber = 2;
